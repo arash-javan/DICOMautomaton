@@ -1194,7 +1194,7 @@ bool SDL_Viewer(Drover &DICOM_data,
         double rot_y = 0.0; // Yaw.
         double rot_p = 0.0; // Pitch.
         double rot_r = 0.0; // Roll.
-        quaternion orientation = quaternion::identity();
+        quaternion orientation = quaternion().identity();
 
         double zoom = 1.0;
         double cam_distort = 0.0;
@@ -10298,7 +10298,7 @@ bool SDL_Viewer(Drover &DICOM_data,
                         const auto y_rot = mesh_display_transform.rot_y * deg_to_rad;
                         const auto p_rot = mesh_display_transform.rot_p * deg_to_rad;
                         const auto r_rot = mesh_display_transform.rot_r * deg_to_rad;
-                        mesh_display_transform.orientation = quaternion::from_euler_ypr(y_rot, p_rot, r_rot);
+                        mesh_display_transform.orientation = quaternion().from_euler_ypr(y_rot, p_rot, r_rot);
                     };
                     if(ImGui::DragScalar("Yaw", ImGuiDataType_Double, &mesh_display_transform.rot_y, drag_speed, &clamp_l, &clamp_h, "%.1f")){
                         sync_orientation_from_euler();
@@ -10323,42 +10323,42 @@ bool SDL_Viewer(Drover &DICOM_data,
                         mesh_display_transform.rot_y = 0.0;
                         mesh_display_transform.rot_p = 0.0;
                         mesh_display_transform.rot_r = 0.0;
-                        mesh_display_transform.orientation = quaternion::from_euler_ypr(0.0, 0.0, 0.0);
+                        mesh_display_transform.orientation = quaternion().from_euler_ypr(0.0, 0.0, 0.0);
                     }
                     ImGui::SameLine();
                     if(ImGui::Button("Back")){
                         mesh_display_transform.rot_y = 180.0;
                         mesh_display_transform.rot_p = 0.0;
                         mesh_display_transform.rot_r = 0.0;
-                        mesh_display_transform.orientation = quaternion::from_euler_ypr(pi, 0.0, 0.0);
+                        mesh_display_transform.orientation = quaternion().from_euler_ypr(pi, 0.0, 0.0);
                     }
                     ImGui::SameLine();
                     if(ImGui::Button("Left")){
                         mesh_display_transform.rot_y = 90.0;
                         mesh_display_transform.rot_p = 0.0;
                         mesh_display_transform.rot_r = 0.0;
-                        mesh_display_transform.orientation = quaternion::from_euler_ypr(0.5 * pi, 0.0, 0.0);
+                        mesh_display_transform.orientation = quaternion().from_euler_ypr(0.5 * pi, 0.0, 0.0);
                     }
                     ImGui::SameLine();
                     if(ImGui::Button("Right")){
                         mesh_display_transform.rot_y = -90.0;
                         mesh_display_transform.rot_p = 0.0;
                         mesh_display_transform.rot_r = 0.0;
-                        mesh_display_transform.orientation = quaternion::from_euler_ypr(-0.5 * pi, 0.0, 0.0);
+                        mesh_display_transform.orientation = quaternion().from_euler_ypr(-0.5 * pi, 0.0, 0.0);
                     }
                     ImGui::SameLine();
                     if(ImGui::Button("Top")){
                         mesh_display_transform.rot_y = 0.0;
                         mesh_display_transform.rot_p = 90.0;
                         mesh_display_transform.rot_r = 0.0;
-                        mesh_display_transform.orientation = quaternion::from_euler_ypr(0.0, 0.5 * pi, 0.0);
+                        mesh_display_transform.orientation = quaternion().from_euler_ypr(0.0, 0.5 * pi, 0.0);
                     }
                     ImGui::SameLine();
                     if(ImGui::Button("Bottom")){
                         mesh_display_transform.rot_y = 0.0;
                         mesh_display_transform.rot_p = -90.0;
                         mesh_display_transform.rot_r = 0.0;
-                        mesh_display_transform.orientation = quaternion::from_euler_ypr(0.0, -0.5 * pi, 0.0);
+                        mesh_display_transform.orientation = quaternion().from_euler_ypr(0.0, -0.5 * pi, 0.0);
                     }
 
                     if(ImGui::Button("Reset")){
@@ -10477,12 +10477,12 @@ bool SDL_Viewer(Drover &DICOM_data,
 
             {
                 if(mesh_display_transform.precess){
-                    const auto q_y = quaternion::from_axis_angle(kCameraYawAxis,
-                                                                 (kPrecessionYawRate * mesh_display_transform.precess_rate) * kDegToRad);
-                    const auto q_x = quaternion::from_axis_angle(kCameraPitchAxis,
-                                                                 (kPrecessionPitchRate * mesh_display_transform.precess_rate) * kDegToRad);
-                    const auto q_z = quaternion::from_axis_angle(kCameraRollAxis,
-                                                                 (kPrecessionRollRate * mesh_display_transform.precess_rate) * kDegToRad);
+                    const auto q_y = quaternion().from_axis_angle(kCameraYawAxis,
+                                                                   (kPrecessionYawRate * mesh_display_transform.precess_rate) * kDegToRad);
+                    const auto q_x = quaternion().from_axis_angle(kCameraPitchAxis,
+                                                                   (kPrecessionPitchRate * mesh_display_transform.precess_rate) * kDegToRad);
+                    const auto q_z = quaternion().from_axis_angle(kCameraRollAxis,
+                                                                   (kPrecessionRollRate * mesh_display_transform.precess_rate) * kDegToRad);
                     mesh_display_transform.orientation = (q_y * q_z * q_x * mesh_display_transform.orientation).normalized();
                 }
                 sync_euler_from_orientation();
@@ -10528,7 +10528,7 @@ bool SDL_Viewer(Drover &DICOM_data,
                                                    static_cast<double>(mpos.y - delta.y),
                                                    nav_w,
                                                    nav_h);
-                    const auto q_drag = quaternion::from_two_unit_vectors(prev, curr);
+                    const auto q_drag = quaternion().from_two_unit_vectors(prev, curr);
                     mesh_display_transform.orientation = (mesh_display_transform.orientation * q_drag).normalized();
                     ImGui::ResetMouseDragDelta(ImGuiMouseButton_Left);
                 }
@@ -10543,7 +10543,7 @@ bool SDL_Viewer(Drover &DICOM_data,
                 if(ImGui::IsMouseDragging(ImGuiMouseButton_Right)){
                     const auto delta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Right);
                     const auto roll_rad = static_cast<double>(delta.x) * kTrackballRollDegreesPerPixel * kDegToRad;
-                    const auto q_roll = quaternion::from_axis_angle(kCameraForward, -roll_rad);
+                    const auto q_roll = quaternion().from_axis_angle(kCameraForward, -roll_rad);
                     mesh_display_transform.orientation = (mesh_display_transform.orientation * q_roll).normalized();
                     ImGui::ResetMouseDragDelta(ImGuiMouseButton_Right);
                 }
