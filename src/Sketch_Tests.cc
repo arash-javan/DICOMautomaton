@@ -3,6 +3,8 @@
 #include "doctest20251212/doctest.h"
 
 #include <array>
+#include <chrono>
+#include <filesystem>
 #include <set>
 #include <vector>
 
@@ -137,6 +139,56 @@ TEST_CASE("Sketch set_plane refreshes derived arc geometry"){
     REQUIRE( samples.back().z == doctest::Approx(1.0).epsilon(1E-6) );
 }
 
+TEST_CASE("Sketch arcs keep endpoints on the circle"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    const auto arc_idx = sketch.add_arc(vec3<double>(0.0, 0.0, 0.0),
+                                        vec3<double>(1.0, 0.0, 0.0),
+                                        vec3<double>(2.0, 2.0, 0.0),
+                                        Sketch::geometry_tag_t::normal);
+
+    const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(sketch.primitive(arc_idx));
+    REQUIRE( arc != nullptr );
+    REQUIRE( sketch.vertex(arc->start).distance(sketch.vertex(arc->center)) == doctest::Approx(1.0).epsilon(1E-6) );
+    REQUIRE( sketch.vertex(arc->stop).distance(sketch.vertex(arc->center)) == doctest::Approx(1.0).epsilon(1E-6) );
+
+    sketch.set_vertex(arc->stop, vec3<double>(3.0, 0.5, 0.0));
+    REQUIRE( sketch.vertex(arc->stop).distance(sketch.vertex(arc->center)) == doctest::Approx(1.0).epsilon(1E-6) );
+
+    const auto samples = sketch.sample_primitive(arc_idx, 24U);
+    REQUIRE( !samples.empty() );
+    REQUIRE( samples.back().distance(sketch.vertex(arc->stop)) <= 1.0E-6 );
+}
+
+TEST_CASE("Sketch refresh updates cached geometry after shared arc endpoint snapping"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+
+    const auto circle_idx = sketch.add_circle(vec3<double>(0.0, 0.0, 0.0),
+                                              vec3<double>(1.0, 0.0, 0.0),
+                                              Sketch::geometry_tag_t::normal);
+    const auto arc_idx = sketch.add_arc(vec3<double>(0.0, 0.0, 0.0),
+                                        vec3<double>(1.0, 0.0, 0.0),
+                                        vec3<double>(0.0, 1.0, 0.0),
+                                        Sketch::geometry_tag_t::normal);
+
+    auto *circle = dynamic_cast<Sketch::circle_primitive_t*>(sketch.primitive(circle_idx));
+    auto *arc = dynamic_cast<Sketch::arc_primitive_t*>(sketch.primitive(arc_idx));
+    REQUIRE( circle != nullptr );
+    REQUIRE( arc != nullptr );
+
+    circle->center = arc->center;
+    circle->radius_point = arc->stop;
+    sketch.refresh_geometry();
+
+    sketch.set_vertex(arc->stop, vec3<double>(3.0, 4.0, 0.0));
+
+    const auto *updated_circle = dynamic_cast<const Sketch::circle_primitive_t*>(sketch.primitive(circle_idx));
+    REQUIRE( updated_circle != nullptr );
+    REQUIRE( updated_circle->radius == doctest::Approx(1.0).epsilon(1E-6) );
+    REQUIRE( sketch.vertex(arc->stop).distance(sketch.vertex(arc->center)) == doctest::Approx(1.0).epsilon(1E-6) );
+}
+
 TEST_CASE("Sketch deleting a vertex removes dependent primitives and constraints"){
     Sketch sketch;
     sketch.set_plane(default_xy_plane());
@@ -153,4 +205,77 @@ TEST_CASE("Sketch deleting a vertex removes dependent primitives and constraints
     REQUIRE( sketch.vertex_count() == 1U );
     REQUIRE( sketch.primitive_count() == 0U );
     REQUIRE( sketch.constraint_count() == 0U );
+}
+
+TEST_CASE("Sketch tracks nominal degrees of freedom"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    const auto line_idx = sketch.add_line(vec3<double>(0.0, 0.0, 0.0),
+                                          vec3<double>(2.0, 1.0, 0.0),
+                                          Sketch::geometry_tag_t::normal);
+    sketch.add_horizontal_constraint(line_idx);
+    const auto disabled_idx = sketch.add_distance_constraint(line_idx, 2.0);
+    sketch.constraint(disabled_idx)->enabled = false;
+
+    const auto dof = sketch.summarize_degrees_of_freedom();
+    REQUIRE( dof.total == 4U );
+    REQUIRE( dof.enabled_constraints == 1U );
+    REQUIRE( dof.disabled_constraints == 1U );
+    REQUIRE( dof.constrained == 1U );
+    REQUIRE( dof.remaining == 3U );
+    REQUIRE( dof.overconstrained == 0U );
+}
+
+TEST_CASE("Sketch can delete unreferenced vertices without corrupting indices"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    sketch.add_line(vec3<double>(0.0, 0.0, 0.0),
+                    vec3<double>(1.0, 0.0, 0.0),
+                    Sketch::geometry_tag_t::normal);
+    sketch.append_vertex(vec3<double>(5.0, 5.0, 0.0));
+    const auto second_line_idx = sketch.add_line(vec3<double>(2.0, 0.0, 0.0),
+                                                 vec3<double>(3.0, 0.0, 0.0),
+                                                 Sketch::geometry_tag_t::support);
+    sketch.add_horizontal_constraint(second_line_idx);
+
+    REQUIRE( sketch.vertex_count() == 5U );
+    REQUIRE( sketch.delete_unreferenced_vertices() == 1U );
+    REQUIRE( sketch.vertex_count() == 4U );
+    REQUIRE( sketch.constraint_count() == 1U );
+
+    const auto *second_line = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(second_line_idx));
+    REQUIRE( second_line != nullptr );
+    REQUIRE( second_line->vertices[0] == 2U );
+    REQUIRE( second_line->vertices[1] == 3U );
+    const auto *constraint = dynamic_cast<const Sketch::horizontal_constraint_t*>(sketch.constraint(0U));
+    REQUIRE( constraint != nullptr );
+    REQUIRE( constraint->line == second_line_idx );
+}
+
+TEST_CASE("Sketch files round-trip through disk serialization"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    const auto line_idx = sketch.add_line(vec3<double>(0.123456789012345, 0.0, 0.0),
+                                          vec3<double>(2.123456789012345, 0.0, 0.0),
+                                          Sketch::geometry_tag_t::support);
+    sketch.add_distance_constraint(line_idx, 2.0);
+
+    const auto unique_suffix = std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    const auto path = std::filesystem::temp_directory_path() / ("dcma_sketch_roundtrip_test_" + unique_suffix + ".dcmasketch");
+    std::string error_message;
+    REQUIRE( sketch.save_to_file(path, &error_message) );
+
+    Sketch loaded;
+    REQUIRE( Sketch::load_from_file(path, loaded, &error_message) );
+    REQUIRE( loaded.has_plane() );
+    REQUIRE( loaded.vertex_count() == sketch.vertex_count() );
+    REQUIRE( loaded.primitive_count() == sketch.primitive_count() );
+    REQUIRE( loaded.constraint_count() == sketch.constraint_count() );
+    const auto *loaded_line = dynamic_cast<const Sketch::line_primitive_t*>(loaded.primitive(0U));
+    REQUIRE( loaded_line != nullptr );
+    REQUIRE( loaded_line->tag == Sketch::geometry_tag_t::support );
+    REQUIRE( loaded.vertex(loaded_line->vertices[0]).x == doctest::Approx(0.123456789012345).epsilon(1E-15) );
+    REQUIRE( loaded.vertex(loaded_line->vertices[1]).x == doctest::Approx(2.123456789012345).epsilon(1E-15) );
+
+    std::filesystem::remove(path);
 }
