@@ -228,12 +228,28 @@ elif [[ "${DISTRIBUTION}" =~ .*mxe.* ]] ; then
 elif [[ "${DISTRIBUTION}" =~ .*debian.* ]] ; then
     printf 'Compiling for Debian...\n'
 
-    # Check whether Ygor is up-to-date or not.
+    # Check whether custom packages are installed and up-to-date.
+    #
+    # Note: it's usually better to do this and disable fetchcontent fallback, because there can be conflict
+    # when DICOMautomaton gets installed with Ygor files, and thus 'owns' them, when the user later updates/installs
+    # Ygor.
     (
         rm -rf /tmp/ygor &>/dev/null || true
         git clone --depth 1 'https://github.com/hdclark/Ygor.git' /tmp/ygor
         cd /tmp/ygor
         ./compile_and_install.sh && rm -rf /tmp/ygor &>/dev/null || true
+    )
+    (
+        rm -rf /tmp/ygorcluster &>/dev/null || true
+        git clone --depth 1 'https://github.com/hdclark/YgorClustering.git' /tmp/ygorcluster
+        cd /tmp/ygorcluster
+        ./compile_and_install.sh && rm -rf /tmp/ygorcluster &>/dev/null || true
+    )
+    (
+        rm -rf /tmp/explicator &>/dev/null || true
+        git clone --depth 1 'https://github.com/hdclark/Explicator.git' /tmp/explicator
+        cd /tmp/explicator
+        ./compile_and_install.sh && rm -rf /tmp/explicator &>/dev/null || true
     )
 
     mkdir -p build
@@ -251,6 +267,7 @@ elif [[ "${DISTRIBUTION}" =~ .*debian.* ]] ; then
           -DWITH_ASAN=OFF \
           -DWITH_TSAN=OFF \
           -DWITH_MSAN=OFF \
+          -DWITH_FETCHCONTENT_FALLBACK=OFF \
           ../
     fi
     JOBS=$(nproc)
@@ -300,6 +317,7 @@ else  # Generic build and install.
       -DWITH_ASAN=OFF \
       -DWITH_TSAN=OFF \
       -DWITH_MSAN=OFF \
+      -DWITH_FETCHCONTENT_FALLBACK=ON \
       ../
     JOBS=$(nproc)
     JOBS=$(( JOBS < 8 ? JOBS : 8 )) # Limit to reduce memory use.

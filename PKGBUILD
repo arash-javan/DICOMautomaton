@@ -88,6 +88,7 @@ build() {
     -DWITH_POSTGRES=OFF \
     -DWITH_JANSSON=ON \
     -DAdaptiveCpp_DIR="/usr/include/AdaptiveCPP/" \
+    -DWITH_FETCHCONTENT_FALLBACK=OFF \
     \
     ../
 
