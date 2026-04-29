@@ -6983,10 +6983,9 @@ bool SDL_Viewer(Drover &DICOM_data,
                             if(slot.history.current().build_extruded_surface_mesh(extrusion_options, extruded_mesh, &error_message)){
                                 auto mesh_metadata = coalesce_metadata_for_basic_mesh(disp_img_it->metadata, meta_evolve::iterate);
                                 const auto mesh_label = "Sketch Extrusion " + std::to_string(sketch_slot_num);
-                                Explicator explicator("SketchExtrusion");
                                 extruded_mesh.metadata = mesh_metadata;
                                 extruded_mesh.metadata["MeshLabel"] = mesh_label;
-                                extruded_mesh.metadata["NormalizedMeshLabel"] = explicator(mesh_label);
+                                extruded_mesh.metadata["NormalizedMeshLabel"] = mesh_label;
                                 extruded_mesh.metadata["Description"] = "Extruded vector sketch surface mesh";
                                 DICOM_data.smesh_data.emplace_back(std::make_shared<Surface_Mesh>());
                                 DICOM_data.smesh_data.back()->meshes = std::move(extruded_mesh);
