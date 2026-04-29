@@ -129,6 +129,177 @@ TEST_CASE("Sketch constraints resolve simple geometry"){
     REQUIRE( doctest::Approx(sketch.vertex(distance->vertices[0]).distance(sketch.vertex(distance->vertices[1]))).epsilon(1E-6) == 5.0 );
 }
 
+TEST_CASE("Sketch tangent constraints solve line-circle tangency"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+
+    const auto circle_idx = sketch.add_circle(vec3<double>(0.0, 0.0, 0.0),
+                                              vec3<double>(1.0, 0.0, 0.0),
+                                              Sketch::geometry_tag_t::normal);
+    const auto line_idx = sketch.add_line(vec3<double>(-2.0, 0.4, 0.0),
+                                          vec3<double>(2.0, 0.4, 0.0),
+                                          Sketch::geometry_tag_t::support);
+
+    const auto *circle = dynamic_cast<const Sketch::circle_primitive_t*>(sketch.primitive(circle_idx));
+    const auto *line = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(line_idx));
+    REQUIRE( circle != nullptr );
+    REQUIRE( line != nullptr );
+
+    sketch.add_pin_constraint(circle->center);
+    sketch.add_pin_constraint(circle->radius_point);
+    sketch.add_tangent_constraint(circle_idx, line_idx);
+
+    Sketch::solve_options_t options;
+    options.max_iterations = 128U;
+    const auto unresolved = sketch.solve_constraints(options);
+    REQUIRE( unresolved == 0U );
+
+    const auto centre = sketch.vertex(circle->center);
+    const auto p0 = sketch.vertex(line->vertices[0]);
+    const auto p1 = sketch.vertex(line->vertices[1]);
+    const auto cross_product_mag = std::abs(((centre.x - p0.x) * (p1.y - p0.y)) - ((centre.y - p0.y) * (p1.x - p0.x)));
+    const auto denominator = std::hypot(p1.x - p0.x, p1.y - p0.y);
+    REQUIRE( denominator > 1.0E-9 );
+    REQUIRE( doctest::Approx(cross_product_mag / denominator).epsilon(1E-4) == 1.0 );
+}
+
+TEST_CASE("Sketch tangent constraints report infeasible fixed geometry"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+
+    const auto circle_idx = sketch.add_circle(vec3<double>(0.0, 0.0, 0.0),
+                                              vec3<double>(3.0, 0.0, 0.0),
+                                              Sketch::geometry_tag_t::normal);
+    const auto line_idx = sketch.add_line(vec3<double>(-2.0, 1.0, 0.0),
+                                          vec3<double>(2.0, 1.0, 0.0),
+                                          Sketch::geometry_tag_t::support);
+
+    const auto *circle = dynamic_cast<const Sketch::circle_primitive_t*>(sketch.primitive(circle_idx));
+    const auto *line = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(line_idx));
+    REQUIRE( circle != nullptr );
+    REQUIRE( line != nullptr );
+
+    sketch.add_pin_constraint(circle->center);
+    sketch.add_pin_constraint(circle->radius_point);
+    sketch.add_pin_constraint(line->vertices[0]);
+    sketch.add_pin_constraint(line->vertices[1]);
+    sketch.add_tangent_constraint(circle_idx, line_idx);
+
+    Sketch::solve_options_t options;
+    options.max_iterations = 128U;
+    REQUIRE( sketch.solve_constraints(options) != 0U );
+}
+
+TEST_CASE("Sketch sticky constraints stabilize underconstrained solutions"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+
+    const auto line_a_idx = sketch.add_line(vec3<double>(0.0, 0.0, 0.0),
+                                            vec3<double>(4.0, 0.0, 0.0),
+                                            Sketch::geometry_tag_t::support);
+    const auto line_b_idx = sketch.add_line(vec3<double>(10.0, 5.0, 0.0),
+                                            vec3<double>(12.0, 5.2, 0.0),
+                                            Sketch::geometry_tag_t::normal);
+
+    const auto *line_a = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(line_a_idx));
+    const auto *line_b = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(line_b_idx));
+    REQUIRE( line_a != nullptr );
+    REQUIRE( line_b != nullptr );
+
+    const auto original_line_b_start = sketch.vertex(line_b->vertices[0]);
+    const auto original_line_b_stop = sketch.vertex(line_b->vertices[1]);
+
+    sketch.add_pin_constraint(line_a->vertices[0]);
+    sketch.add_pin_constraint(line_a->vertices[1]);
+    sketch.add_parallel_constraint(line_a_idx, line_b_idx);
+    sketch.add_distance_constraint(line_b_idx, 4.0);
+
+    Sketch::solve_options_t options;
+    options.max_iterations = 128U;
+    options.sticky_weight = 1.0E-1;
+    const auto unresolved = sketch.solve_constraints(options);
+    REQUIRE( unresolved == 0U );
+
+    const auto solved_line_b_start = sketch.vertex(line_b->vertices[0]);
+    const auto solved_line_b_stop = sketch.vertex(line_b->vertices[1]);
+    // The reference line is anchored during post-solve refinement, so the free line's leading
+    // endpoint should remain closer to its original position than the trailing endpoint that is
+    // explicitly adjusted to satisfy the length/direction constraints.
+    CHECK( solved_line_b_start.distance(original_line_b_start) < solved_line_b_stop.distance(original_line_b_stop) );
+    CHECK( doctest::Approx(solved_line_b_start.y).epsilon(1E-5) == solved_line_b_stop.y );
+    CHECK( doctest::Approx(solved_line_b_start.distance(solved_line_b_stop)).epsilon(1E-5) == 4.0 );
+}
+
+TEST_CASE("Sketch solver reports conflicting constraints"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+
+    const auto line_idx = sketch.add_line(vec3<double>(0.0, 0.0, 0.0),
+                                          vec3<double>(2.0, 1.0, 0.0),
+                                          Sketch::geometry_tag_t::normal);
+    const auto *line = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(line_idx));
+    REQUIRE( line != nullptr );
+
+    sketch.add_pin_constraint(line->vertices[0]);
+    sketch.add_horizontal_constraint(line_idx);
+    sketch.add_vertical_constraint(line_idx);
+    sketch.add_distance_constraint(line_idx, 5.0);
+
+    Sketch::solve_options_t options;
+    options.max_iterations = 128U;
+    const auto unresolved = sketch.solve_constraints(options);
+    REQUIRE( unresolved != 0U );
+    REQUIRE( sketch.last_solve_report().unresolved_constraints == unresolved );
+#ifdef DCMA_USE_EIGEN
+    REQUIRE( sketch.last_solve_report().used_svd );
+    REQUIRE( sketch.last_solve_report().conflicting_constraints );
+    REQUIRE( sketch.last_solve_report().jacobian_rank <= sketch.last_solve_report().residual_count );
+#endif // DCMA_USE_EIGEN
+}
+
+TEST_CASE("Sketch copy preserves the last solve report"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+
+    const auto line_idx = sketch.add_line(vec3<double>(0.0, 0.0, 0.0),
+                                          vec3<double>(2.0, 1.0, 0.0),
+                                          Sketch::geometry_tag_t::normal);
+    sketch.add_horizontal_constraint(line_idx);
+
+    Sketch::solve_options_t options;
+    options.max_iterations = 32U;
+    REQUIRE( sketch.solve_constraints(options) == 0U );
+
+    Sketch copied = sketch;
+    REQUIRE( copied.last_solve_report().unresolved_constraints == sketch.last_solve_report().unresolved_constraints );
+    REQUIRE( copied.last_solve_report().iterations == sketch.last_solve_report().iterations );
+    REQUIRE( copied.last_solve_report().reason == sketch.last_solve_report().reason );
+}
+
+TEST_CASE("Sketch solve report resets when no constraints are present"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+
+    const auto line_idx = sketch.add_line(vec3<double>(0.0, 0.0, 0.0),
+                                          vec3<double>(2.0, 1.0, 0.0),
+                                          Sketch::geometry_tag_t::normal);
+    sketch.add_horizontal_constraint(line_idx);
+
+    Sketch::solve_options_t options;
+    options.max_iterations = 32U;
+    REQUIRE( sketch.solve_constraints(options) == 0U );
+    REQUIRE( !sketch.last_solve_report().reason.empty() );
+
+    sketch.clear();
+    sketch.set_plane(default_xy_plane());
+    REQUIRE( sketch.solve_constraints(options) == 0U );
+    REQUIRE( sketch.last_solve_report().unresolved_constraints == 0U );
+    REQUIRE( sketch.last_solve_report().enabled_constraints == 0U );
+    REQUIRE( sketch.last_solve_report().residual_count == 0U );
+    REQUIRE( sketch.last_solve_report().reason.empty() );
+    REQUIRE( std::isnan(sketch.last_solve_report().cost) );
+}
+
 TEST_CASE("Sketch snapshots preserve state"){
     Sketch sketch;
     sketch.set_plane(default_xy_plane());
@@ -526,6 +697,27 @@ TEST_CASE("Sketch parallel constraints preserve reversed line orientation"){
     const auto b1 = sketch.vertex(parallel_line->vertices[1]);
     REQUIRE( b1.x < b0.x );
     REQUIRE( b1.y == doctest::Approx(b0.y).epsilon(1E-6) );
+}
+
+TEST_CASE("Sketch parallel and perpendicular constraints reject degenerate lines"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+
+    const auto reference_line = sketch.add_line(vec3<double>(0.0, 0.0, 0.0),
+                                                vec3<double>(4.0, 0.0, 0.0),
+                                                Sketch::geometry_tag_t::normal);
+    const auto degenerate_parallel = sketch.add_line(vec3<double>(1.0, 1.0, 0.0),
+                                                     vec3<double>(1.0, 1.0, 0.0),
+                                                     Sketch::geometry_tag_t::normal);
+    const auto degenerate_perpendicular = sketch.add_line(vec3<double>(2.0, 2.0, 0.0),
+                                                          vec3<double>(2.0, 2.0, 0.0),
+                                                          Sketch::geometry_tag_t::normal);
+
+    sketch.add_parallel_constraint(reference_line, degenerate_parallel);
+    sketch.add_perpendicular_constraint(reference_line, degenerate_perpendicular);
+
+    REQUIRE( sketch.solve_constraints() == 2U );
+    REQUIRE( sketch.last_solve_report().unresolved_constraints == 2U );
 }
 
 TEST_CASE("Sketch perpendicular constraints preserve reversed line orientation"){
