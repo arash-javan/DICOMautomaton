@@ -742,3 +742,163 @@ TEST_CASE("Sketch perpendicular constraints preserve reversed line orientation")
     REQUIRE( b1.y < b0.y );
     REQUIRE( b1.x == doctest::Approx(b0.x).epsilon(1E-6) );
 }
+
+TEST_CASE("Sketch image-frame bounds clamp and solver keep vertices inside"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    const auto line_idx = sketch.add_line(vec3<double>(-2.0, -1.0, 0.0),
+                                          vec3<double>(12.0, 11.0, 0.0),
+                                          Sketch::geometry_tag_t::normal);
+    const auto *line = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(line_idx));
+    REQUIRE( line != nullptr );
+
+    Sketch::bounding_box_t bounds;
+    bounds.min = { 0.0, 0.0 };
+    bounds.max = { 10.0, 10.0 };
+
+    REQUIRE( sketch.clamp_vertices_to_bounds(bounds) );
+    for(const auto vertex_idx : line->referenced_vertices()){
+        const auto projected = sketch.project(sketch.vertex(vertex_idx));
+        CHECK( projected.u >= (bounds.min.u - 1.0E-6) );
+        CHECK( projected.u <= (bounds.max.u + 1.0E-6) );
+        CHECK( projected.v >= (bounds.min.v - 1.0E-6) );
+        CHECK( projected.v <= (bounds.max.v + 1.0E-6) );
+    }
+
+    sketch.set_vertex(line->vertices[0], vec3<double>(-5.0, 5.0, 0.0));
+    sketch.set_vertex(line->vertices[1], vec3<double>(15.0, 5.0, 0.0));
+    Sketch::solve_options_t options;
+    options.max_iterations = 64U;
+    options.enable_sticky_constraints = false;
+    options.constrain_to_bounds = true;
+    options.bounds = bounds;
+    REQUIRE( sketch.solve_constraints(options) == 0U );
+    for(const auto vertex_idx : line->referenced_vertices()){
+        const auto projected = sketch.project(sketch.vertex(vertex_idx));
+        CHECK( projected.u >= (bounds.min.u - 1.0E-6) );
+        CHECK( projected.u <= (bounds.max.u + 1.0E-6) );
+        CHECK( projected.v >= (bounds.min.v - 1.0E-6) );
+        CHECK( projected.v <= (bounds.max.v + 1.0E-6) );
+    }
+}
+
+TEST_CASE("Sketch extrusion validates span direction"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    sketch.add_line(vec3<double>(0.0, 0.0, 0.0),
+                    vec3<double>(5.0, 0.0, 0.0),
+                    Sketch::geometry_tag_t::normal);
+
+    Sketch::extrusion_options_t options;
+    options.into_frame_length = 5.0;
+    options.out_of_frame_length = -6.0;
+    fv_surface_mesh<double, uint64_t> mesh;
+    std::string error_message;
+    REQUIRE_FALSE( sketch.build_extruded_surface_mesh(options, mesh, &error_message) );
+    REQUIRE_FALSE( error_message.empty() );
+}
+
+TEST_CASE("Sketch extrusion produces uniformly oriented capped meshes"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    sketch.add_circle(vec3<double>(0.0, 0.0, 0.0),
+                      vec3<double>(2.0, 0.0, 0.0),
+                      Sketch::geometry_tag_t::normal);
+
+    Sketch::extrusion_options_t options;
+    options.into_frame_length = 5.0;
+    options.out_of_frame_length = 5.0;
+    options.curve_segments = 24U;
+
+    fv_surface_mesh<double, uint64_t> mesh;
+    REQUIRE( sketch.build_extruded_surface_mesh(options, mesh) );
+    REQUIRE( !mesh.vertices.empty() );
+    REQUIRE( !mesh.faces.empty() );
+
+    double min_z = std::numeric_limits<double>::infinity();
+    double max_z = -std::numeric_limits<double>::infinity();
+    bool saw_near_cap = false;
+    bool saw_far_cap = false;
+    for(const auto &vertex : mesh.vertices){
+        min_z = std::min(min_z, vertex.z);
+        max_z = std::max(max_z, vertex.z);
+    }
+    CHECK( min_z == doctest::Approx(-5.0).epsilon(1E-6) );
+    CHECK( max_z == doctest::Approx(5.0).epsilon(1E-6) );
+
+    for(const auto &face : mesh.faces){
+        REQUIRE( face.size() == 3U );
+        const auto &a = mesh.vertices.at(face.at(0));
+        const auto &b = mesh.vertices.at(face.at(1));
+        const auto &c = mesh.vertices.at(face.at(2));
+        const auto normal = (b - a).Cross(c - a);
+        const bool near_cap = (std::abs(a.z + 5.0) <= 1.0E-6)
+                           && (std::abs(b.z + 5.0) <= 1.0E-6)
+                           && (std::abs(c.z + 5.0) <= 1.0E-6);
+        const bool far_cap = (std::abs(a.z - 5.0) <= 1.0E-6)
+                          && (std::abs(b.z - 5.0) <= 1.0E-6)
+                          && (std::abs(c.z - 5.0) <= 1.0E-6);
+        if(near_cap){
+            saw_near_cap = true;
+            CHECK( normal.z < 0.0 );
+        }
+        if(far_cap){
+            saw_far_cap = true;
+            CHECK( normal.z > 0.0 );
+        }
+    }
+
+    CHECK( saw_near_cap );
+    CHECK( saw_far_cap );
+}
+
+TEST_CASE("Sketch extrusion stitches line loops and preserves holes in end caps"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+
+    // Outer square loop built from separate line primitives.
+    sketch.add_line(vec3<double>(-5.0, -5.0, 0.0), vec3<double>( 5.0, -5.0, 0.0), Sketch::geometry_tag_t::normal);
+    sketch.add_line(vec3<double>( 5.0, -5.0, 0.0), vec3<double>( 5.0,  5.0, 0.0), Sketch::geometry_tag_t::normal);
+    sketch.add_line(vec3<double>( 5.0,  5.0, 0.0), vec3<double>(-5.0,  5.0, 0.0), Sketch::geometry_tag_t::normal);
+    sketch.add_line(vec3<double>(-5.0,  5.0, 0.0), vec3<double>(-5.0, -5.0, 0.0), Sketch::geometry_tag_t::normal);
+
+    // Inner square loop should become a hole.
+    sketch.add_line(vec3<double>(-2.0, -2.0, 0.0), vec3<double>( 2.0, -2.0, 0.0), Sketch::geometry_tag_t::normal);
+    sketch.add_line(vec3<double>( 2.0, -2.0, 0.0), vec3<double>( 2.0,  2.0, 0.0), Sketch::geometry_tag_t::normal);
+    sketch.add_line(vec3<double>( 2.0,  2.0, 0.0), vec3<double>(-2.0,  2.0, 0.0), Sketch::geometry_tag_t::normal);
+    sketch.add_line(vec3<double>(-2.0,  2.0, 0.0), vec3<double>(-2.0, -2.0, 0.0), Sketch::geometry_tag_t::normal);
+
+    Sketch::extrusion_options_t options;
+    options.into_frame_length = 3.0;
+    options.out_of_frame_length = 2.0;
+
+    fv_surface_mesh<double, uint64_t> mesh;
+    REQUIRE( sketch.build_extruded_surface_mesh(options, mesh) );
+    REQUIRE( !mesh.faces.empty() );
+
+    bool saw_cap_face = false;
+    bool saw_annulus_face = false;
+    for(const auto &face : mesh.faces){
+        REQUIRE( face.size() == 3U );
+        const auto &a = mesh.vertices.at(face.at(0));
+        const auto &b = mesh.vertices.at(face.at(1));
+        const auto &c = mesh.vertices.at(face.at(2));
+        const bool is_cap = (std::abs(a.z + 2.0) <= 1.0E-6 && std::abs(b.z + 2.0) <= 1.0E-6 && std::abs(c.z + 2.0) <= 1.0E-6)
+                         || (std::abs(a.z - 3.0) <= 1.0E-6 && std::abs(b.z - 3.0) <= 1.0E-6 && std::abs(c.z - 3.0) <= 1.0E-6);
+        if(!is_cap) continue;
+        saw_cap_face = true;
+
+        const vec3<double> face_center = (a + b + c) / 3.0;
+        const auto projected = sketch.project(face_center);
+        const bool inside_outer = (std::abs(projected.u) < 5.0) && (std::abs(projected.v) < 5.0);
+        const bool inside_hole = (std::abs(projected.u) < 2.0) && (std::abs(projected.v) < 2.0);
+        CHECK( inside_outer );
+        CHECK_FALSE( inside_hole );
+        if((2.2 < std::abs(projected.u)) || (2.2 < std::abs(projected.v))){
+            saw_annulus_face = true;
+        }
+    }
+
+    CHECK( saw_cap_face );
+    CHECK( saw_annulus_face );
+}

@@ -20,6 +20,7 @@
     #include <eigen3/Eigen/Sparse>
 #endif // DCMA_USE_EIGEN
 
+#include "YgorMathDelaunay.h"
 #include "YgorOptimizeLM.h"
 
 namespace {
@@ -334,6 +335,305 @@ static double projected_distance(const Sketch::projection_t &a,
     return std::hypot(a.u - b.u, a.v - b.v);
 }
 
+static Sketch::projection_t clamp_to_bounds(const Sketch::projection_t &p,
+                                            const Sketch::bounding_box_t &bounds){
+    return {
+        std::clamp(p.u, bounds.min.u, bounds.max.u),
+        std::clamp(p.v, bounds.min.v, bounds.max.v)
+    };
+}
+
+static double signed_polygon_area(const std::vector<Sketch::projection_t> &points){
+    if(points.size() < 3U) return 0.0;
+    double twice_area = 0.0;
+    for(std::size_t i = 0U; i < points.size(); ++i){
+        const auto &a = points.at(i);
+        const auto &b = points.at((i + 1U) % points.size());
+        twice_area += (a.u * b.v) - (b.u * a.v);
+    }
+    return twice_area * 0.5;
+}
+
+static bool points_coincident(const vec3<double> &a,
+                              const vec3<double> &b,
+                              double tolerance = 1.0E-6){
+    return a.distance(b) <= tolerance;
+}
+
+static void append_triangle(fv_surface_mesh<double, uint64_t> &mesh,
+                            uint64_t a,
+                            uint64_t b,
+                            uint64_t c){
+    if((a == b) || (b == c) || (a == c)) return;
+    mesh.faces.emplace_back(std::vector<uint64_t>{ a, b, c });
+}
+
+struct extruded_path_t {
+    std::vector<vec3<double>> points;
+    bool closed = false;
+};
+
+static std::vector<vec3<double>> deduplicate_polyline_points(const std::vector<vec3<double>> &polyline,
+                                                             bool *closed_out = nullptr){
+    std::vector<vec3<double>> out;
+    out.reserve(polyline.size());
+    for(const auto &point : polyline){
+        if(out.empty() || !points_coincident(out.back(), point)){
+            out.push_back(point);
+        }
+    }
+
+    bool closed = false;
+    if((out.size() >= 2U) && points_coincident(out.front(), out.back())){
+        out.pop_back();
+        closed = true;
+    }
+    if(closed_out != nullptr) *closed_out = closed;
+    return out;
+}
+
+static std::vector<Sketch::projection_t> project_polyline(const Sketch &sketch,
+                                                          const std::vector<vec3<double>> &polyline){
+    std::vector<Sketch::projection_t> out;
+    out.reserve(polyline.size());
+    for(const auto &point : polyline){
+        out.push_back(sketch.project(point));
+    }
+    return out;
+}
+
+static double signed_triangle_area2(const Sketch::projection_t &a,
+                                    const Sketch::projection_t &b,
+                                    const Sketch::projection_t &c){
+    return ((b.u - a.u) * (c.v - a.v)) - ((b.v - a.v) * (c.u - a.u));
+}
+
+static bool point_on_segment(const Sketch::projection_t &p,
+                             const Sketch::projection_t &a,
+                             const Sketch::projection_t &b,
+                             double tolerance = 1.0E-8){
+    const auto cross = signed_triangle_area2(a, b, p);
+    if(std::abs(cross) > tolerance) return false;
+    const auto dot = ((p.u - a.u) * (p.u - b.u)) + ((p.v - a.v) * (p.v - b.v));
+    return dot <= tolerance;
+}
+
+static bool point_in_polygon(const Sketch::projection_t &p,
+                             const std::vector<Sketch::projection_t> &polygon){
+    if(polygon.size() < 3U) return false;
+    bool inside = false;
+    constexpr double tolerance = 1.0E-8;
+    for(std::size_t i = 0U, j = polygon.size() - 1U; i < polygon.size(); j = i++){
+        const auto &a = polygon.at(j);
+        const auto &b = polygon.at(i);
+        if(point_on_segment(p, a, b)) return true;
+        if(std::abs(b.v - a.v) <= tolerance) continue;
+        const bool intersects = ((a.v > p.v) != (b.v > p.v))
+                             && (p.u < ((b.u - a.u) * (p.v - a.v) / (b.v - a.v)) + a.u);
+        if(intersects) inside = !inside;
+    }
+    return inside;
+}
+
+static bool point_in_filled_loops(const Sketch::projection_t &p,
+                                  const std::vector<std::vector<Sketch::projection_t>> &loops){
+    std::size_t containing_loops = 0U;
+    for(const auto &loop : loops){
+        if(point_in_polygon(p, loop)){
+            ++containing_loops;
+        }
+    }
+    return ((containing_loops % 2U) == 1U);
+}
+
+static bool edge_midpoints_inside_filled_loops(const Sketch::projection_t &a,
+                                               const Sketch::projection_t &b,
+                                               const Sketch::projection_t &c,
+                                               const std::vector<std::vector<Sketch::projection_t>> &loops){
+    const std::array<Sketch::projection_t, 3> midpoints = {{
+        { (a.u + b.u) * 0.5, (a.v + b.v) * 0.5 },
+        { (b.u + c.u) * 0.5, (b.v + c.v) * 0.5 },
+        { (c.u + a.u) * 0.5, (c.v + a.v) * 0.5 }
+    }};
+    return std::all_of(std::begin(midpoints), std::end(midpoints), [&](const auto &midpoint){
+        return point_in_filled_loops(midpoint, loops);
+    });
+}
+
+static bool merge_extruded_paths(extruded_path_t &lhs,
+                                 extruded_path_t &rhs){
+    if(lhs.closed || rhs.closed || (lhs.points.size() < 2U) || (rhs.points.size() < 2U)){
+        return false;
+    }
+
+    if(points_coincident(lhs.points.back(), rhs.points.front())){
+        lhs.points.insert(std::end(lhs.points), std::next(std::begin(rhs.points)), std::end(rhs.points));
+    }else if(points_coincident(lhs.points.back(), rhs.points.back())){
+        std::reverse(std::begin(rhs.points), std::end(rhs.points));
+        lhs.points.insert(std::end(lhs.points), std::next(std::begin(rhs.points)), std::end(rhs.points));
+    }else if(points_coincident(lhs.points.front(), rhs.points.back())){
+        lhs.points.insert(std::begin(lhs.points), std::begin(rhs.points), std::prev(std::end(rhs.points)));
+    }else if(points_coincident(lhs.points.front(), rhs.points.front())){
+        std::reverse(std::begin(rhs.points), std::end(rhs.points));
+        lhs.points.insert(std::begin(lhs.points), std::begin(rhs.points), std::prev(std::end(rhs.points)));
+    }else{
+        return false;
+    }
+
+    lhs.points = deduplicate_polyline_points(lhs.points, &lhs.closed);
+    rhs.points.clear();
+    rhs.closed = false;
+    return true;
+}
+
+static std::vector<extruded_path_t> collect_extruded_paths(const Sketch &sketch,
+                                                           std::size_t curve_segments){
+    std::vector<extruded_path_t> paths;
+    for(std::size_t primitive_idx = 0U; primitive_idx < sketch.primitive_count(); ++primitive_idx){
+        const auto *primitive_ptr = sketch.primitive(primitive_idx);
+        if(primitive_ptr == nullptr) continue;
+        if(primitive_ptr->kind() == Sketch::primitive_kind_t::vertex) continue;
+
+        const auto sampled_points = sketch.sample_primitive(primitive_idx, curve_segments);
+        if(sampled_points.size() < 2U) continue;
+
+        bool closed = (primitive_ptr->kind() == Sketch::primitive_kind_t::circle);
+        auto points = deduplicate_polyline_points(sampled_points, &closed);
+        if(points.size() < 2U) continue;
+        if(closed && (points.size() < 3U)) continue;
+        paths.push_back(extruded_path_t{ std::move(points), closed });
+    }
+
+    bool merged_any = true;
+    while(merged_any){
+        merged_any = false;
+        for(std::size_t i = 0U; i < paths.size(); ++i){
+            if(paths.at(i).closed || paths.at(i).points.empty()) continue;
+            for(std::size_t j = i + 1U; j < paths.size(); ++j){
+                if(paths.at(j).closed || paths.at(j).points.empty()) continue;
+                if(merge_extruded_paths(paths.at(i), paths.at(j))){
+                    merged_any = true;
+                    break;
+                }
+            }
+            if(merged_any) break;
+        }
+    }
+
+    paths.erase(std::remove_if(std::begin(paths), std::end(paths), [](const auto &path){
+        return path.points.size() < 2U;
+    }), std::end(paths));
+    return paths;
+}
+
+static void append_extruded_polyline_sides(const Sketch &sketch,
+                                           const extruded_path_t &path,
+                                           double near_offset,
+                                           double far_offset,
+                                           fv_surface_mesh<double, uint64_t> &mesh){
+    if(path.points.size() < 2U) return;
+    if(path.closed && (path.points.size() < 3U)) return;
+
+    const auto normal = sketch.plane().normal();
+    const uint64_t base_vertex = static_cast<uint64_t>(mesh.vertices.size());
+    for(const auto &point : path.points){
+        mesh.vertices.emplace_back(point + normal * near_offset);
+        mesh.vertices.emplace_back(point + normal * far_offset);
+    }
+
+    bool closed_ccw = true;
+    if(path.closed){
+        const auto projected_points = project_polyline(sketch, path.points);
+        closed_ccw = (signed_polygon_area(projected_points) >= 0.0);
+    }
+
+    const auto emit_side_faces = [&](uint64_t i, uint64_t j) -> void {
+        const auto near_i = base_vertex + (i * 2U);
+        const auto far_i = near_i + 1U;
+        const auto near_j = base_vertex + (j * 2U);
+        const auto far_j = near_j + 1U;
+        if(!path.closed || closed_ccw){
+            append_triangle(mesh, near_i, near_j, far_j);
+            append_triangle(mesh, near_i, far_j, far_i);
+        }else{
+            append_triangle(mesh, near_i, far_j, near_j);
+            append_triangle(mesh, near_i, far_i, far_j);
+        }
+    };
+
+    for(uint64_t i = 0U; (i + 1U) < static_cast<uint64_t>(path.points.size()); ++i){
+        emit_side_faces(i, i + 1U);
+    }
+    if(path.closed){
+        emit_side_faces(static_cast<uint64_t>(path.points.size() - 1U), 0U);
+    }
+}
+
+static void append_extruded_end_caps(const Sketch &sketch,
+                                     const std::vector<extruded_path_t> &paths,
+                                     double near_offset,
+                                     double far_offset,
+                                     fv_surface_mesh<double, uint64_t> &mesh){
+    std::vector<std::vector<Sketch::projection_t>> closed_loops;
+    std::vector<vec3<double>> cap_vertices_2d;
+    std::vector<vec3<double>> cap_vertices_world;
+    for(const auto &path : paths){
+        if(!path.closed || (path.points.size() < 3U)) continue;
+        auto projected_loop = project_polyline(sketch, path.points);
+        if(projected_loop.size() < 3U) continue;
+        closed_loops.push_back(projected_loop);
+        cap_vertices_world.insert(std::end(cap_vertices_world), std::begin(path.points), std::end(path.points));
+        for(const auto &point : projected_loop){
+            cap_vertices_2d.emplace_back(point.u, point.v, 0.0);
+        }
+    }
+    if(closed_loops.empty() || (cap_vertices_2d.size() < 3U)) return;
+
+    const auto planar_caps = Delaunay_Triangulation_2<double, uint64_t>(cap_vertices_2d);
+    if(planar_caps.faces.empty()) return;
+
+    const auto normal = sketch.plane().normal();
+    const uint64_t near_base = static_cast<uint64_t>(mesh.vertices.size());
+    for(const auto &point : cap_vertices_world){
+        mesh.vertices.emplace_back(point + normal * near_offset);
+    }
+    const uint64_t far_base = static_cast<uint64_t>(mesh.vertices.size());
+    for(const auto &point : cap_vertices_world){
+        mesh.vertices.emplace_back(point + normal * far_offset);
+    }
+
+    for(const auto &face : planar_caps.faces){
+        if(face.size() != 3U) continue;
+        const auto &a = cap_vertices_2d.at(face.at(0));
+        const auto &b = cap_vertices_2d.at(face.at(1));
+        const auto &c = cap_vertices_2d.at(face.at(2));
+        const Sketch::projection_t centroid = {
+            (a.x + b.x + c.x) / 3.0,
+            (a.y + b.y + c.y) / 3.0
+        };
+        if(!point_in_filled_loops(centroid, closed_loops)) continue;
+
+        const Sketch::projection_t pa{ a.x, a.y };
+        const Sketch::projection_t pb{ b.x, b.y };
+        const Sketch::projection_t pc{ c.x, c.y };
+        if(!edge_midpoints_inside_filled_loops(pa, pb, pc, closed_loops)) continue;
+
+        const auto area2 = signed_triangle_area2(pa, pb, pc);
+        if(std::abs(area2) <= solver_min_epsilon) continue;
+
+        const auto i0 = static_cast<uint64_t>(face.at(0));
+        const auto i1 = static_cast<uint64_t>(face.at(1));
+        const auto i2 = static_cast<uint64_t>(face.at(2));
+        if(area2 > 0.0){
+            append_triangle(mesh, far_base + i0, far_base + i1, far_base + i2);
+            append_triangle(mesh, near_base + i0, near_base + i2, near_base + i1);
+        }else{
+            append_triangle(mesh, far_base + i0, far_base + i2, far_base + i1);
+            append_triangle(mesh, near_base + i0, near_base + i1, near_base + i2);
+        }
+    }
+}
+
 // Treat segments shorter than the solver epsilon as ill-defined so directional
 // constraints can report them as unresolved instead of silently satisfying a
 // zero determinant/dot-product identity.
@@ -591,6 +891,22 @@ struct sketch_solver_context_t {
 
             }else{
                 append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
+            }
+        }
+
+        if(options.constrain_to_bounds && options.bounds && options.bounds->is_valid()){
+            for(std::size_t i = 0U; i < initial_vertices.size(); ++i){
+                const auto projected = projected_vertex(state, i);
+                const auto min_u_violation = std::max(options.bounds->min.u - projected.u, 0.0);
+                const auto max_u_violation = std::max(projected.u - options.bounds->max.u, 0.0);
+                const auto min_v_violation = std::max(options.bounds->min.v - projected.v, 0.0);
+                const auto max_v_violation = std::max(projected.v - options.bounds->max.v, 0.0);
+                append_residual_block(residuals, blocks, sketch.constraint_count() + i, {
+                    min_u_violation,
+                    max_u_violation,
+                    min_v_violation,
+                    max_v_violation
+                }, true);
             }
         }
 
@@ -1545,6 +1861,26 @@ Sketch::refresh_geometry(){
     refresh_all_derived_geometry();
 }
 
+bool
+Sketch::clamp_vertices_to_bounds(const bounding_box_t &bounds){
+    if(!has_plane_ || !bounds.is_valid()) return false;
+
+    bool changed = false;
+    for(auto &point : vertices_){
+        const auto projected = project(point);
+        const auto clamped = clamp_to_bounds(projected, bounds);
+        if((std::abs(projected.u - clamped.u) > solver_min_epsilon)
+        || (std::abs(projected.v - clamped.v) > solver_min_epsilon)){
+            point = lift(clamped);
+            changed = true;
+        }
+    }
+    if(changed){
+        refresh_all_derived_geometry();
+    }
+    return changed;
+}
+
 Sketch::dof_summary_t
 Sketch::summarize_degrees_of_freedom() const{
     dof_summary_t out;
@@ -2027,7 +2363,8 @@ std::size_t
 Sketch::solve_constraints(const solve_options_t &options){
     last_solve_report_ = {};
 
-    if(!has_plane_ || constraints_.empty() || vertices_.empty()){
+    const bool solve_with_bounds = options.constrain_to_bounds && options.bounds && options.bounds->is_valid();
+    if(!has_plane_ || vertices_.empty() || (constraints_.empty() && !solve_with_bounds)){
         return 0U;
     }
 
@@ -2115,7 +2452,7 @@ Sketch::solve_constraints(const solve_options_t &options){
     // Tangency is solved by the LM pass itself; the linear post-pass can move
     // vertices in ways that undo that nonlinear solution, so skip refinement
     // entirely whenever tangent constraints are active.
-    if(!has_tangent_constraints){
+    if(!has_tangent_constraints && !constraints_.empty()){
         const auto refinement_passes = std::min<std::size_t>(std::max<std::size_t>(options.max_iterations, 1U),
                                                              max_refinement_passes);
         for(std::size_t iter = 0U; iter < refinement_passes; ++iter){
@@ -2250,6 +2587,9 @@ Sketch::solve_constraints(const solve_options_t &options){
         }
     }
     refresh_all_derived_geometry();
+    if(solve_with_bounds){
+        clamp_vertices_to_bounds(options.bounds.value());
+    }
 
     std::vector<residual_block_t> final_blocks;
     std::size_t final_enabled_constraints = 0U;
@@ -2337,6 +2677,43 @@ Sketch::solve_constraints(const solve_options_t &options){
 const Sketch::solve_report_t&
 Sketch::last_solve_report() const{
     return last_solve_report_;
+}
+
+bool
+Sketch::build_extruded_surface_mesh(const extrusion_options_t &options,
+                                    fv_surface_mesh<double, uint64_t> &mesh,
+                                    std::string *error_message) const{
+    mesh = {};
+
+    if(!has_plane_){
+        store_error(error_message, "Unable to extrude sketch without an embedded plane");
+        return false;
+    }
+    if((options.into_frame_length + options.out_of_frame_length) <= solver_min_epsilon){
+        store_error(error_message,
+                    "Extrusion lengths may be negative, but they must sum to a positive distance between the caps");
+        return false;
+    }
+
+    const double near_offset = -options.out_of_frame_length;
+    const double far_offset = options.into_frame_length;
+    const auto curve_segments = std::max<std::size_t>(options.curve_segments, 16U);
+    const auto paths = collect_extruded_paths(*this, curve_segments);
+    bool emitted_geometry = false;
+    for(const auto &path : paths){
+        append_extruded_polyline_sides(*this, path, near_offset, far_offset, mesh);
+        emitted_geometry = emitted_geometry || !path.points.empty();
+    }
+    append_extruded_end_caps(*this, paths, near_offset, far_offset, mesh);
+
+    if(!emitted_geometry || mesh.faces.empty()){
+        store_error(error_message, "Sketch does not contain any extrudable primitives");
+        mesh = {};
+        return false;
+    }
+
+    mesh.recreate_involved_face_index();
+    return true;
 }
 
 std::string
