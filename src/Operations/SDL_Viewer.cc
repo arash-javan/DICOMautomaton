@@ -6174,7 +6174,7 @@ bool SDL_Viewer(Drover &DICOM_data,
                     const auto effective_hovered_constraint = sketch_hovered_constraint ? sketch_hovered_constraint
                                                                                         : sketch_editor_hovered_constraint;
                     const auto fully_constrained_vertices = sketch.fully_constrained_vertices();
-                    auto fully_constrained_primitives = decltype(sketch.fully_constrained_primitives()){};
+                    std::set<Sketch::primitive_index_t> fully_constrained_primitives;
                     auto constraint_highlight_vertices = std::set<Sketch::vertex_index_t>{};
                     auto constraint_highlight_primitives = std::set<Sketch::primitive_index_t>{};
                     if(effective_hovered_constraint){
@@ -6827,28 +6827,6 @@ bool SDL_Viewer(Drover &DICOM_data,
                     slot.clear_selection();
                     slot.clear_vertex_selection();
                 }
-                ImGui::SameLine();
-                if(ImGui::Button("Insert Vertex Mode")){
-                    sketch_tool_mode = sketch_tool_mode_t::insert_vertex;
-                    sketch_pending_primitive.clear();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("Collapse Vertices Mode")){
-                    const auto ordered_vertices = slot.ordered_selected_vertices();
-                    if(ordered_vertices.size() == 2U){
-                        const auto keep_vertex = ordered_vertices.front();
-                        const auto remove_vertex = ordered_vertices.back();
-                        apply_sketch_edit(disp_img_it, [&](Sketch &editable_sketch){
-                            editable_sketch.collapse_vertices(keep_vertex, remove_vertex);
-                        });
-                        slot.clear_selection();
-                        slot.set_single_vertex_selection(keep_vertex);
-                        sketch_tool_mode = sketch_tool_mode_t::select;
-                    }else{
-                        sketch_tool_mode = sketch_tool_mode_t::collapse_vertices;
-                    }
-                    sketch_pending_primitive.clear();
-                }
 
                 std::vector<std::size_t> selected_lines;
                 std::vector<std::size_t> selected_rounds;
@@ -6875,6 +6853,11 @@ bool SDL_Viewer(Drover &DICOM_data,
                         });
                     }
                 }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select one or more line primitives");
+                    ImGui::EndTooltip();
+                }
                 ImGui::SameLine();
                 if(ImGui::Button("Vertical")){
                     if(!selected_lines.empty()){
@@ -6885,11 +6868,21 @@ bool SDL_Viewer(Drover &DICOM_data,
                         });
                     }
                 }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select one or more line primitives");
+                    ImGui::EndTooltip();
+                }
                 ImGui::SameLine();
                 if(ImGui::Button("Distance")){
                     if(!selected_lines.empty()){
                         open_numeric_constraint_popup(sketch_numeric_constraint_mode_t::distance, selected_lines);
                     }
+                }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select one or more line primitives");
+                    ImGui::EndTooltip();
                 }
                 ImGui::SameLine();
                 if(ImGui::Button("Length")){
@@ -6897,11 +6890,21 @@ bool SDL_Viewer(Drover &DICOM_data,
                         open_numeric_constraint_popup(sketch_numeric_constraint_mode_t::length, selected_lines);
                     }
                 }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select one or more line primitives");
+                    ImGui::EndTooltip();
+                }
                 ImGui::SameLine();
                 if(ImGui::Button("Radius")){
                     if(!selected_rounds.empty()){
                         open_numeric_constraint_popup(sketch_numeric_constraint_mode_t::radius, selected_rounds);
                     }
+                }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select one or more circle or arc primitives");
+                    ImGui::EndTooltip();
                 }
                 if(ImGui::Button("Parallel")){
                     if(selected_lines.size() == 2U){
@@ -6910,6 +6913,11 @@ bool SDL_Viewer(Drover &DICOM_data,
                         });
                     }
                 }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select exactly two line primitives");
+                    ImGui::EndTooltip();
+                }
                 ImGui::SameLine();
                 if(ImGui::Button("Perpendicular")){
                     if(selected_lines.size() == 2U){
@@ -6917,6 +6925,11 @@ bool SDL_Viewer(Drover &DICOM_data,
                             editable_sketch.add_perpendicular_constraint(selected_lines[0], selected_lines[1]);
                         });
                     }
+                }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select exactly two line primitives");
+                    ImGui::EndTooltip();
                 }
                 ImGui::SameLine();
                 if(ImGui::Button("Pin")){
@@ -6930,6 +6943,11 @@ bool SDL_Viewer(Drover &DICOM_data,
                         });
                     }
                 }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select one or more vertices");
+                    ImGui::EndTooltip();
+                }
                 ImGui::SameLine();
                 if(ImGui::Button("Tangent")){
                     if(slot.selection.size() == 2U){
@@ -6942,6 +6960,11 @@ bool SDL_Viewer(Drover &DICOM_data,
                         });
                     }
                 }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select exactly two primitives (line, circle, arc)");
+                    ImGui::EndTooltip();
+                }
                 ImGui::SameLine();
                 if(ImGui::Button("Mirror")){
                     if((selected_lines.size() == 1U) && (selected_vertices.size() == 2U)){
@@ -6949,6 +6972,11 @@ bool SDL_Viewer(Drover &DICOM_data,
                             editable_sketch.add_mirror_constraint(selected_lines[0], selected_vertices[0], selected_vertices[1]);
                         });
                     }
+                }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select exactly one line primitive and two vertices");
+                    ImGui::EndTooltip();
                 }
                 ImGui::SameLine();
                 if(ImGui::Button("Overlap")){
@@ -6960,8 +6988,38 @@ bool SDL_Viewer(Drover &DICOM_data,
                         });
                     }
                 }
+                if(ImGui::IsItemHovered()){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Select exactly two vertices");
+                    ImGui::EndTooltip();
+                }
 
                 ImGui::Separator();
+                ImGui::SetNextItemOpen(false, ImGuiCond_FirstUseEver);
+                if(ImGui::CollapsingHeader("Modify Primitives")){
+                    if(ImGui::Button("Insert Vertex")){
+                        sketch_tool_mode = sketch_tool_mode_t::insert_vertex;
+                        sketch_pending_primitive.clear();
+                    }
+                    ImGui::SameLine();
+                    if(ImGui::Button("Collapse Vertices")){
+                        const auto ordered_vertices = slot.ordered_selected_vertices();
+                        if(ordered_vertices.size() == 2U){
+                            const auto keep_vertex = ordered_vertices.front();
+                            const auto remove_vertex = ordered_vertices.back();
+                            apply_sketch_edit(disp_img_it, [&](Sketch &editable_sketch){
+                                editable_sketch.collapse_vertices(keep_vertex, remove_vertex);
+                            });
+                            slot.clear_selection();
+                            slot.set_single_vertex_selection(keep_vertex);
+                            sketch_tool_mode = sketch_tool_mode_t::select;
+                        }else{
+                            sketch_tool_mode = sketch_tool_mode_t::collapse_vertices;
+                        }
+                        sketch_pending_primitive.clear();
+                    }
+                }
+
                 ImGui::SetNextItemOpen(false, ImGuiCond_FirstUseEver);
                 if(ImGui::CollapsingHeader("Constraint Solving")){
                     ImGui::Checkbox("Solve on edit", &sketch_solve_on_edit);
@@ -7022,6 +7080,17 @@ bool SDL_Viewer(Drover &DICOM_data,
                                     DICOM_data.smesh_data.back()->meshes = std::move(surface_mesh);
                                 };
 
+                                auto extrude_sketch = slot.history.current();
+                                // Remove support primitives and unreferenced vertices before extruding.
+                                for(std::size_t i = 0; i < extrude_sketch.primitive_count(); ){
+                                    if(extrude_sketch.primitive(i)->tag == Sketch::geometry_tag_t::support){
+                                        extrude_sketch.delete_primitive(i);
+                                    }else{
+                                        ++i;
+                                    }
+                                }
+                                extrude_sketch.delete_unreferenced_vertices();
+
                                 Sketch::extrusion_options_t extrusion_options;
                                 extrusion_options.into_frame_length = sketch_extrude_into_frame;
                                 extrusion_options.out_of_frame_length = sketch_extrude_out_of_frame;
@@ -7031,7 +7100,7 @@ bool SDL_Viewer(Drover &DICOM_data,
                                 std::vector<fv_surface_mesh<double, uint64_t>> cap_meshes;
                                 std::string error_message;
                                 const auto mesh_label = "Sketch Extrusion " + std::to_string(sketch_slot_num);
-                                if(slot.history.current().build_extruded_surface_mesh(extrusion_options,
+                                if(extrude_sketch.build_extruded_surface_mesh(extrusion_options,
                                                                                      extruded_mesh,
                                                                                      sketch_export_extrusion_caps ? &cap_meshes : nullptr,
                                                                                      &error_message)){
