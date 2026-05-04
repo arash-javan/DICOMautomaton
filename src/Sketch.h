@@ -340,6 +340,7 @@ public:
     std::optional<vertex_index_t> insert_vertex(primitive_index_t idx, const vec3<double> &point);
     bool collapse_vertices(vertex_index_t keep_idx, vertex_index_t remove_idx);
     bool add_fillet(primitive_index_t line_a_idx, primitive_index_t line_b_idx, double radius, std::string *error_message = nullptr);
+    bool swap_arc_orientation(primitive_index_t arc_idx);
     void clear_vertices();
     void clear_primitives();
     void clear_constraints();

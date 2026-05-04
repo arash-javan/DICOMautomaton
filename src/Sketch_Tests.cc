@@ -913,6 +913,123 @@ TEST_CASE("Sketch extrusion supports taper angles and cap mesh export"){
     CHECK( far_radius == doctest::Approx(3.0).epsilon(1E-4) );
 }
 
+TEST_CASE("Sketch swap arc orientation flips the arc endpoints"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    // Arc from angle 0 to angle pi/2 around origin with radius 2.
+    const auto arc_idx = sketch.add_arc(vec3<double>(0.0, 0.0, 0.0),
+                                        vec3<double>(2.0, 0.0, 0.0),
+                                        vec3<double>(0.0, 2.0, 0.0),
+                                        Sketch::geometry_tag_t::normal);
+    const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(sketch.primitive(arc_idx));
+    REQUIRE( arc != nullptr );
+    const auto orig_start = arc->start;
+    const auto orig_stop = arc->stop;
+
+    REQUIRE( sketch.swap_arc_orientation(arc_idx) );
+    REQUIRE( arc->start == orig_stop );
+    REQUIRE( arc->stop == orig_start );
+
+    // Swapping again should revert.
+    REQUIRE( sketch.swap_arc_orientation(arc_idx) );
+    REQUIRE( arc->start == orig_start );
+    REQUIRE( arc->stop == orig_stop );
+}
+
+TEST_CASE("Sketch swap arc orientation rejects non-arc primitives"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    const auto line_idx = sketch.add_line(vec3<double>(0.0, 0.0, 0.0),
+                                          vec3<double>(1.0, 0.0, 0.0),
+                                          Sketch::geometry_tag_t::normal);
+    REQUIRE_FALSE( sketch.swap_arc_orientation(line_idx) );
+    REQUIRE_FALSE( sketch.swap_arc_orientation(sketch.primitive_count() + 99U) );
+}
+
+TEST_CASE("Sketch fillet picks the shorter arc"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    // Two lines meeting at origin: one along +x, one along +y (90-degree corner).
+    const auto shared = sketch.append_vertex(vec3<double>(0.0, 0.0, 0.0));
+    const auto right = sketch.append_vertex(vec3<double>(3.0, 0.0, 0.0));
+    const auto up = sketch.append_vertex(vec3<double>(0.0, 3.0, 0.0));
+    const auto line_a = sketch.add_line(shared, right, Sketch::geometry_tag_t::normal);
+    const auto line_b = sketch.add_line(shared, up, Sketch::geometry_tag_t::normal);
+
+    REQUIRE( sketch.add_fillet(line_a, line_b, 1.0) );
+    // The fillet adds an arc primitive as the last primitive.
+    const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(sketch.primitive(sketch.primitive_count() - 1U));
+    REQUIRE( arc != nullptr );
+
+    // The arc should span approximately 90 degrees (positive coordinate quadrant).
+    const double sweep = arc->stop_angle - arc->start_angle;
+    CHECK( sweep > 0.0 );
+    CHECK( sweep <= doctest::Approx(3.1415926535897931).epsilon(0.01) ); // <= pi
+}
+
+TEST_CASE("Sketch tangent pre-positioning helps arc-line convergence"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    // Arc at origin with radius 1.5, line segment offset from tangency.
+    const auto arc_idx = sketch.add_arc(vec3<double>(0.0, 0.0, 0.0),
+                                        vec3<double>(1.5, 0.0, 0.0),
+                                        vec3<double>(0.0, 1.5, 0.0),
+                                        Sketch::geometry_tag_t::normal);
+    const auto line_idx = sketch.add_line(vec3<double>(-3.0, 2.0, 0.0),
+                                          vec3<double>(3.0, 2.0, 0.0),
+                                          Sketch::geometry_tag_t::normal);
+
+    const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(sketch.primitive(arc_idx));
+    const auto *line = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(line_idx));
+    REQUIRE( arc != nullptr );
+    REQUIRE( line != nullptr );
+
+    sketch.add_pin_constraint(arc->center);
+    sketch.add_pin_constraint(arc->start);
+    sketch.add_tangent_constraint(arc_idx, line_idx);
+
+    Sketch::solve_options_t options;
+    options.max_iterations = 256U;
+    const auto unresolved = sketch.solve_constraints(options);
+    REQUIRE( unresolved == 0U );
+
+    // After solving, the distance from the arc centre to the line should equal the radius.
+    const auto centre = sketch.vertex(arc->center);
+    const auto p0 = sketch.vertex(line->vertices[0]);
+    const auto p1 = sketch.vertex(line->vertices[1]);
+    const auto radius = centre.distance(sketch.vertex(arc->start));
+    const auto cross = std::abs(((centre.x - p0.x) * (p1.y - p0.y)) - ((centre.y - p0.y) * (p1.x - p0.x)));
+    const auto denom = std::hypot(p1.x - p0.x, p1.y - p0.y);
+    REQUIRE( denom > 1.0E-9 );
+    CHECK( doctest::Approx(cross / denom).epsilon(1E-4) == radius );
+}
+
+TEST_CASE("Sketch distance constraint on arc length works correctly"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    // Arc at origin, radius 2, spanning roughly 90 degrees.
+    // The arc length is approximately pi * 2/2 = pi ~= 3.1416.
+    const auto arc_idx = sketch.add_arc(vec3<double>(0.0, 0.0, 0.0),
+                                        vec3<double>(2.0, 0.0, 0.0),
+                                        vec3<double>(0.0, 2.0, 0.0),
+                                        Sketch::geometry_tag_t::normal);
+    const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(sketch.primitive(arc_idx));
+    REQUIRE( arc != nullptr );
+
+    // Verify the initial radius is 2.0.
+    const auto initial_radius = sketch.vertex(arc->center).distance(sketch.vertex(arc->start));
+    CHECK( doctest::Approx(initial_radius).epsilon(1E-6) == 2.0 );
+
+    // Apply a radius constraint of 3.0 through the distance constraint.
+    sketch.add_pin_constraint(arc->center);
+    sketch.add_distance_constraint(arc_idx, 3.0);
+    const auto unresolved = sketch.solve_constraints();
+    REQUIRE( unresolved == 0U );
+
+    const auto final_radius = sketch.vertex(arc->center).distance(sketch.vertex(arc->start));
+    CHECK( doctest::Approx(final_radius).epsilon(1E-4) == 3.0 );
+}
+
 TEST_CASE("Sketch extrusion stitches line loops and preserves holes in end caps"){
     Sketch sketch;
     sketch.set_plane(default_xy_plane());

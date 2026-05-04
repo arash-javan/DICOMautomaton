@@ -724,7 +724,6 @@ static void append_extruded_end_caps(const Sketch &sketch,
         const Sketch::projection_t pa{ a.x, a.y };
         const Sketch::projection_t pb{ b.x, b.y };
         const Sketch::projection_t pc{ c.x, c.y };
-        if(!edge_midpoints_inside_filled_loops(pa, pb, pc, closed_loops)) continue;
 
         const auto area2 = signed_triangle_area2(pa, pb, pc);
         if(std::abs(area2) <= solver_min_epsilon) continue;
@@ -1001,8 +1000,11 @@ struct sketch_solver_context_t {
                     const auto p1 = projected_vertex(state, line->b);
                     const auto centre = projected_vertex(state, round->center);
                     const auto radius = round_radius(state, *round);
+                    // Use a smooth squared residual instead of abs() to avoid the
+                    // non-differentiable kink at zero, which helps the LM solver converge.
+                    const auto sd = signed_distance_to_line(centre, p0, p1);
                     append_residual_block(residuals, blocks, constraint_idx, {
-                        std::abs(signed_distance_to_line(centre, p0, p1)) - radius
+                        (sd * sd) - (radius * radius)
                     });
                 }else if(descriptor.mode == tangent_descriptor_t::mode_t::round_round_external
                       || descriptor.mode == tangent_descriptor_t::mode_t::round_round_internal){
@@ -2641,7 +2643,38 @@ Sketch::add_fillet(primitive_index_t line_a_idx,
     }
 
     add_arc(centre_vertex, tan1_vertex, tan2_vertex, geometry_tag_t::normal);
+    // Ensure the fillet arc takes the shorter (inside) path rather than wrapping
+    // around the outside (Omega-shaped). The two tangent points define two possible
+    // arcs on the circle; we want the arc whose sweep angle is <= pi.
+    {
+        const auto last_arc_idx = primitives_.size() - 1U;
+        auto *arc = dynamic_cast<arc_primitive_t*>(primitives_.at(last_arc_idx).get());
+        if(arc != nullptr){
+            const auto arc_start_p = project(vertex(arc->start));
+            const auto arc_stop_p = project(vertex(arc->stop));
+            const auto centre_p = project(centre_pos);
+            const auto start_angle = std::atan2(arc_start_p.v - centre_p.v, arc_start_p.u - centre_p.u);
+            const auto stop_angle = std::atan2(arc_stop_p.v - centre_p.v, arc_stop_p.u - centre_p.u);
+            double sweep = stop_angle - start_angle;
+            if(sweep <= 0.0) sweep += 2.0 * pi_constant;
+            // If the sweep exceeds pi, swapping the endpoints gives the shorter arc.
+            if(sweep > pi_constant){
+                std::swap(arc->start, arc->stop);
+            }
+        }
+    }
     delete_unreferenced_vertices();
+    refresh_all_derived_geometry();
+    return true;
+}
+
+bool
+Sketch::swap_arc_orientation(primitive_index_t arc_idx){
+    if(!primitive_index_valid(arc_idx)) return false;
+    auto *base = primitives_.at(arc_idx).get();
+    auto *arc = dynamic_cast<arc_primitive_t*>(base);
+    if(arc == nullptr) return false;
+    std::swap(arc->start, arc->stop);
     refresh_all_derived_geometry();
     return true;
 }
@@ -2668,6 +2701,85 @@ Sketch::solve_constraints(const solve_options_t &options){
     const auto initial_residuals = context.residual_vector(initial_state, nullptr, &enabled_constraints);
     last_solve_report_.enabled_constraints = enabled_constraints;
     last_solve_report_.residual_count = initial_residuals.size();
+
+    // Pre-position geometry for tangent constraints involving a line and a round primitive.
+    // Move the line endpoint nearest the round such that the line is locally perpendicular to
+    // the radius from the round centre, which guarantees the tangent constraint is satisfied.
+    // This provides a good initial guess for the LM solver and prevents the arc from shrinking
+    // or the solver from converging to a non-tangent arrangement.
+    if(has_plane_){
+        for(std::size_t constraint_idx = 0U; constraint_idx < constraints_.size(); ++constraint_idx){
+            const auto *tangent = dynamic_cast<const tangent_constraint_t*>(constraints_.at(constraint_idx).get());
+            if((tangent == nullptr) || !constraints_.at(constraint_idx)->enabled) continue;
+
+            const auto line_binding = get_line_binding(*this, tangent->primitive_a);
+            const auto round_binding = get_round_binding(*this, tangent->primitive_b);
+            const bool a_is_line = line_binding.has_value();
+            const bool b_is_line = get_line_binding(*this, tangent->primitive_b).has_value();
+            const bool a_is_round = round_binding.has_value();
+            const bool b_is_round = get_round_binding(*this, tangent->primitive_a).has_value();
+
+            std::optional<line_binding_t> line;
+            std::optional<round_binding_t> round;
+            if(a_is_line && b_is_round){
+                line = get_line_binding(*this, tangent->primitive_a);
+                round = get_round_binding(*this, tangent->primitive_b);
+            }else if(a_is_round && b_is_line){
+                line = get_line_binding(*this, tangent->primitive_b);
+                round = get_round_binding(*this, tangent->primitive_a);
+            }
+            if(!line || !round) continue;
+
+            const auto centre_proj = context.projected_vertex(initial_state, round->center);
+            const auto radius_point_proj = context.projected_vertex(initial_state, round->radius_point);
+            const auto radius = projected_distance(centre_proj, radius_point_proj);
+            if(radius <= solver_min_epsilon) continue;
+
+            const auto line_a_proj = context.projected_vertex(initial_state, line->a);
+            const auto line_b_proj = context.projected_vertex(initial_state, line->b);
+            const auto line_dir_u = line_b_proj.u - line_a_proj.u;
+            const auto line_dir_v = line_b_proj.v - line_a_proj.v;
+            const auto line_len = std::hypot(line_dir_u, line_dir_v);
+            if(line_len <= solver_min_epsilon) continue;
+
+            // The line's endpoint nearest the arc centre is the likely contact point.
+            const auto dist_a = projected_distance(line_a_proj, centre_proj);
+            const auto dist_b = projected_distance(line_b_proj, centre_proj);
+            const auto contact_vertex = (dist_a <= dist_b) ? line->a : line->b;
+            const auto other_vertex = (dist_a <= dist_b) ? line->b : line->a;
+
+            const auto contact_proj = context.projected_vertex(initial_state, contact_vertex);
+            const auto other_proj = context.projected_vertex(initial_state, other_vertex);
+            auto radial_u = contact_proj.u - centre_proj.u;
+            auto radial_v = contact_proj.v - centre_proj.v;
+            const auto radial_len = std::hypot(radial_u, radial_v);
+            if(radial_len <= solver_min_epsilon) continue;
+            radial_u /= radial_len;
+            radial_v /= radial_len;
+
+            // Tangent direction is perpendicular to the radius.
+            const auto tangent_u = -radial_v;
+            const auto tangent_v = radial_u;
+
+            // Project the far line endpoint onto the tangent direction to position the contact
+            // point on the tangent line at the correct radius distance from the centre.
+            const auto other_radial_u = other_proj.u - centre_proj.u;
+            const auto other_radial_v = other_proj.v - centre_proj.v;
+            const auto dot = (other_radial_u * tangent_u) + (other_radial_v * tangent_v);
+
+            const auto contact_u = centre_proj.u + radial_u * radius;
+            const auto contact_v = centre_proj.v + radial_v * radius;
+            const auto other_on_tangent_u = contact_u + tangent_u * dot;
+            const auto other_on_tangent_v = contact_v + tangent_v * dot;
+
+            const auto base_contact = contact_vertex * 2U;
+            const auto base_other = other_vertex * 2U;
+            initial_state.at(base_contact)     = contact_u;
+            initial_state.at(base_contact + 1U) = contact_v;
+            initial_state.at(base_other)     = other_on_tangent_u;
+            initial_state.at(base_other + 1U) = other_on_tangent_v;
+        }
+    }
 
     lm_optimizer optimizer;
     optimizer.initial_params = initial_state;
