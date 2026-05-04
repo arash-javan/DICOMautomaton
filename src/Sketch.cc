@@ -531,6 +531,47 @@ static bool merge_extruded_paths(extruded_path_t &lhs,
     return true;
 }
 
+static std::size_t compute_discretization_segments(const Sketch &sketch,
+                                                   Sketch::primitive_index_t idx,
+                                                   double max_error,
+                                                   std::size_t max_segments){
+    const auto *primitive = sketch.primitive(idx);
+    if(!primitive || max_error <= 0.0) return max_segments;
+
+    switch(primitive->kind()){
+        case Sketch::primitive_kind_t::vertex:
+        case Sketch::primitive_kind_t::line:
+            return 1U;
+        case Sketch::primitive_kind_t::circle: {
+            const auto *circle = dynamic_cast<const Sketch::circle_primitive_t*>(primitive);
+            if(!circle || circle->radius <= 0.0) return max_segments;
+            const auto n = static_cast<std::size_t>(std::ceil(2.0 * std::acos(-1.0) * std::sqrt(circle->radius / (8.0 * max_error))));
+            return std::clamp(n, static_cast<std::size_t>(16U), max_segments);
+        }
+        case Sketch::primitive_kind_t::arc: {
+            const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(primitive);
+            if(!arc || arc->radius <= 0.0) return max_segments;
+            auto sweep = arc->stop_angle - arc->start_angle;
+            if(sweep <= 0.0) sweep += 2.0 * std::acos(-1.0);
+            const auto n = static_cast<std::size_t>(std::ceil(sweep * std::sqrt(arc->radius / (8.0 * max_error))));
+            return std::clamp(n, static_cast<std::size_t>(16U), max_segments);
+        }
+        case Sketch::primitive_kind_t::bezier: {
+            const auto samples = sketch.sample_primitive(idx, 48U);
+            if(samples.size() < 2U) return max_segments;
+            double max_dist_sq = 0.0;
+            const auto &first = samples.front();
+            for(const auto &p : samples){
+                max_dist_sq = std::max(max_dist_sq, first.sq_dist(p));
+            }
+            const auto effective_radius = std::max(std::sqrt(max_dist_sq) * 0.5, max_error);
+            const auto n = static_cast<std::size_t>(std::ceil(std::acos(-1.0) * std::sqrt(effective_radius / (8.0 * max_error))));
+            return std::clamp(n, static_cast<std::size_t>(24U), max_segments);
+        }
+    }
+    return max_segments;
+}
+
 static std::vector<extruded_path_t> collect_extruded_paths(const Sketch &sketch,
                                                            std::size_t curve_segments){
     std::vector<extruded_path_t> paths;
@@ -662,6 +703,13 @@ static void append_extruded_end_caps(const Sketch &sketch,
         far_cap_mesh.vertices.emplace_back(scaled_far + normal * far_offset);
     }
 
+    struct cap_face_candidate_t {
+        uint64_t i0;
+        uint64_t i1;
+        uint64_t i2;
+        double area2;
+    };
+    std::vector<cap_face_candidate_t> cap_candidates;
     for(const auto &face : planar_caps.faces){
         if(face.size() != 3U) continue;
         const auto &a = cap_vertices_2d.at(face.at(0));
@@ -684,16 +732,51 @@ static void append_extruded_end_caps(const Sketch &sketch,
         const auto i0 = static_cast<uint64_t>(face.at(0));
         const auto i1 = static_cast<uint64_t>(face.at(1));
         const auto i2 = static_cast<uint64_t>(face.at(2));
-        if(area2 > 0.0){
-            append_triangle(mesh, far_base + i0, far_base + i1, far_base + i2);
-            append_triangle(mesh, near_base + i0, near_base + i2, near_base + i1);
-            append_triangle(far_cap_mesh, i0, i1, i2);
-            append_triangle(near_cap_mesh, i0, i2, i1);
-        }else{
-            append_triangle(mesh, far_base + i0, far_base + i2, far_base + i1);
-            append_triangle(mesh, near_base + i0, near_base + i1, near_base + i2);
-            append_triangle(far_cap_mesh, i0, i2, i1);
-            append_triangle(near_cap_mesh, i0, i1, i2);
+        cap_candidates.push_back(cap_face_candidate_t{ i0, i1, i2, area2 });
+    }
+
+    if(cap_candidates.empty()) return;
+
+    int64_t pos_count = 0;
+    int64_t neg_count = 0;
+    for(const auto &cand : cap_candidates){
+        if(cand.area2 > 0.0) ++pos_count;
+        else ++neg_count;
+    }
+
+    if(pos_count >= neg_count){
+        for(const auto &cand : cap_candidates){
+            const auto i0 = cand.i0;
+            const auto i1 = cand.i1;
+            const auto i2 = cand.i2;
+            if(cand.area2 > 0.0){
+                append_triangle(mesh, far_base + i0, far_base + i1, far_base + i2);
+                append_triangle(mesh, near_base + i0, near_base + i2, near_base + i1);
+                append_triangle(far_cap_mesh, i0, i1, i2);
+                append_triangle(near_cap_mesh, i0, i2, i1);
+            }else{
+                append_triangle(mesh, far_base + i0, far_base + i2, far_base + i1);
+                append_triangle(mesh, near_base + i0, near_base + i1, near_base + i2);
+                append_triangle(far_cap_mesh, i0, i2, i1);
+                append_triangle(near_cap_mesh, i0, i1, i2);
+            }
+        }
+    }else{
+        for(const auto &cand : cap_candidates){
+            const auto i0 = cand.i0;
+            const auto i1 = cand.i1;
+            const auto i2 = cand.i2;
+            if(cand.area2 < 0.0){
+                append_triangle(mesh, far_base + i0, far_base + i2, far_base + i1);
+                append_triangle(mesh, near_base + i0, near_base + i1, near_base + i2);
+                append_triangle(far_cap_mesh, i0, i2, i1);
+                append_triangle(near_cap_mesh, i0, i1, i2);
+            }else{
+                append_triangle(mesh, far_base + i0, far_base + i1, far_base + i2);
+                append_triangle(mesh, near_base + i0, near_base + i2, near_base + i1);
+                append_triangle(far_cap_mesh, i0, i1, i2);
+                append_triangle(near_cap_mesh, i0, i2, i1);
+            }
         }
     }
     if(cap_meshes != nullptr){
@@ -2445,6 +2528,124 @@ Sketch::collapse_vertices(vertex_index_t keep_idx, vertex_index_t remove_idx){
     return true;
 }
 
+bool
+Sketch::add_fillet(primitive_index_t line_a_idx,
+                   primitive_index_t line_b_idx,
+                   double radius,
+                   std::string *error_message){
+    if(!primitive_index_valid(line_a_idx) || !primitive_index_valid(line_b_idx)){
+        store_error(error_message, "Fillet requires valid primitive indices");
+        return false;
+    }
+
+    const auto *line_a = dynamic_cast<const line_primitive_t*>(primitive(line_a_idx));
+    const auto *line_b = dynamic_cast<const line_primitive_t*>(primitive(line_b_idx));
+    if(!line_a || !line_b){
+        store_error(error_message, "Fillet requires two line primitives");
+        return false;
+    }
+
+    if(!std::isfinite(radius) || (radius <= solver_min_epsilon)){
+        store_error(error_message, "Fillet radius must be finite and positive");
+        return false;
+    }
+
+    vertex_index_t shared_vertex = 0U;
+    vertex_index_t a_other = 0U;
+    vertex_index_t b_other = 0U;
+    bool found = false;
+    for(const auto va : line_a->vertices){
+        for(const auto vb : line_b->vertices){
+            if(va == vb){
+                shared_vertex = va;
+                a_other = (va == line_a->vertices[0]) ? line_a->vertices[1] : line_a->vertices[0];
+                b_other = (vb == line_b->vertices[0]) ? line_b->vertices[1] : line_b->vertices[0];
+                found = true;
+                break;
+            }
+        }
+        if(found) break;
+    }
+    if(!found){
+        store_error(error_message, "Fillet requires two lines sharing a common vertex");
+        return false;
+    }
+
+    const auto shared_pos = vertex(shared_vertex);
+    const auto a_pos = vertex(a_other);
+    const auto b_pos = vertex(b_other);
+
+    const auto v1 = a_pos - shared_pos;
+    const auto v2 = b_pos - shared_pos;
+    const auto len1 = v1.length();
+    const auto len2 = v2.length();
+
+    if((len1 < solver_min_epsilon) || (len2 < solver_min_epsilon)){
+        store_error(error_message, "Line segments too short for filleting");
+        return false;
+    }
+
+    const auto cos_angle = std::clamp(v1.Dot(v2) / (len1 * len2), -1.0, 1.0);
+    const auto angle = std::acos(cos_angle);
+
+    if((std::abs(angle) < solver_min_epsilon) || (std::abs(std::acos(-1.0) - angle) < solver_min_epsilon)){
+        store_error(error_message, "Lines are (nearly) collinear; cannot fillet");
+        return false;
+    }
+
+    const auto half_angle = angle * 0.5;
+    const auto sin_half = std::sin(half_angle);
+    const auto tan_half = std::tan(half_angle);
+    const auto tan_dist = radius / tan_half;
+    const auto centre_dist = radius / sin_half;
+
+    if((tan_dist >= len1) || (tan_dist >= len2)){
+        store_error(error_message, "Fillet radius too large for the line segments");
+        return false;
+    }
+
+    const auto u1 = v1 / len1;
+    const auto u2 = v2 / len2;
+
+    const auto bisector_raw = u1 + u2;
+    const auto bisector_len = bisector_raw.length();
+    if(bisector_len < solver_min_epsilon){
+        store_error(error_message, "Unable to compute angle bisector");
+        return false;
+    }
+    const auto bisector = bisector_raw / bisector_len;
+
+    const auto centre_pos = shared_pos + bisector * centre_dist;
+    const auto tan1_pos = shared_pos + u1 * tan_dist;
+    const auto tan2_pos = shared_pos + u2 * tan_dist;
+
+    const auto centre_vertex = append_vertex(centre_pos);
+    const auto tan1_vertex = append_vertex(tan1_pos);
+    const auto tan2_vertex = append_vertex(tan2_pos);
+
+    {
+        auto *la = dynamic_cast<line_primitive_t*>(primitives_.at(line_a_idx).get());
+        if(la){
+            for(auto &v : la->vertices){
+                if(v == shared_vertex) v = tan1_vertex;
+            }
+        }
+    }
+    {
+        auto *lb = dynamic_cast<line_primitive_t*>(primitives_.at(line_b_idx).get());
+        if(lb){
+            for(auto &v : lb->vertices){
+                if(v == shared_vertex) v = tan2_vertex;
+            }
+        }
+    }
+
+    add_arc(centre_vertex, tan1_vertex, tan2_vertex, geometry_tag_t::normal);
+    delete_unreferenced_vertices();
+    refresh_all_derived_geometry();
+    return true;
+}
+
 std::size_t
 Sketch::solve_constraints(std::size_t max_iterations){
     solve_options_t options;
@@ -2855,7 +3056,18 @@ Sketch::build_extruded_surface_mesh(const extrusion_options_t &options,
     const double near_offset = -options.out_of_frame_length;
     const double far_offset = options.into_frame_length;
     try{
-        const auto curve_segments = std::max<std::size_t>(options.curve_segments, 16U);
+        std::size_t computed_segments = options.curve_segments;
+        if(std::isfinite(options.max_discretization_error) && (options.max_discretization_error > 0.0)){
+            computed_segments = 16U;
+            for(std::size_t i = 0U; i < primitive_count(); ++i){
+                const auto *p = primitive(i);
+                if(!p || p->kind() == primitive_kind_t::vertex) continue;
+                if(p->tag == geometry_tag_t::support) continue;
+                computed_segments = std::max(computed_segments,
+                    compute_discretization_segments(*this, i, options.max_discretization_error, 1024U));
+            }
+        }
+        const auto curve_segments = std::max<std::size_t>(computed_segments, 16U);
         const auto paths = collect_extruded_paths(*this, curve_segments);
         const auto bounds = projected_path_bounds(*this, paths);
         if(!bounds.is_valid()){

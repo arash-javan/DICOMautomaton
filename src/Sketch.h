@@ -105,6 +105,7 @@ public:
         double into_frame_angle_degrees = 0.0;
         double out_of_frame_angle_degrees = 0.0;
         std::size_t curve_segments = 48U;
+        double max_discretization_error = 0.1;
     };
 
     struct solve_report_t {
@@ -338,6 +339,7 @@ public:
     std::size_t delete_unreferenced_vertices();
     std::optional<vertex_index_t> insert_vertex(primitive_index_t idx, const vec3<double> &point);
     bool collapse_vertices(vertex_index_t keep_idx, vertex_index_t remove_idx);
+    bool add_fillet(primitive_index_t line_a_idx, primitive_index_t line_b_idx, double radius, std::string *error_message = nullptr);
     void clear_vertices();
     void clear_primitives();
     void clear_constraints();
