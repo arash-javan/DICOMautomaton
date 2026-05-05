@@ -1902,10 +1902,14 @@ bool SDL_Viewer(Drover &DICOM_data,
     const auto append_sketch_log = [&](std::string message) -> void {
         if(message.empty()) return;
         sketch_log_entries.emplace_back(std::move(message));
-        constexpr std::size_t max_log_entries = 256U;
-        if(sketch_log_entries.size() > max_log_entries){
-            sketch_log_entries.erase(std::begin(sketch_log_entries),
-                                     std::end(sketch_log_entries) - static_cast<std::ptrdiff_t>(max_log_entries));
+        constexpr std::size_t max_log_size_bytes = 100UL * 1024UL;
+        while(!sketch_log_entries.empty()){
+            std::size_t total_size = 0U;
+            for(const auto &entry : sketch_log_entries){
+                total_size += entry.size();
+            }
+            if(total_size <= max_log_size_bytes) break;
+            sketch_log_entries.erase(sketch_log_entries.begin());
         }
         sketch_log_scroll_to_bottom = true;
     };
@@ -1974,6 +1978,15 @@ bool SDL_Viewer(Drover &DICOM_data,
     };
     const auto append_sketch_summary_log = [&](const Sketch &sketch) -> void {
         const auto dof = sketch.summarize_degrees_of_freedom();
+        {   // Timestamp for this constraint solve.
+            const auto now = std::chrono::system_clock::now();
+            const auto t = std::chrono::system_clock::to_time_t(now);
+            std::tm tm_buf;
+            localtime_r(&t, &tm_buf);
+            std::stringstream ss;
+            ss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S");
+            append_sketch_log("Solve timestamp: " + ss.str());
+        }
         append_sketch_log("Geometry: " + std::to_string(sketch.primitive_count())
                         + "  Constraints: " + std::to_string(sketch.constraint_count()));
         append_sketch_log("DOF: " + std::to_string(dof.remaining) + " / " + std::to_string(dof.total) + " remaining");
@@ -6392,13 +6405,22 @@ bool SDL_Viewer(Drover &DICOM_data,
                                 const auto mouse_v = mouse_vec.Dot(preview_plane->col_unit);
                                 const auto start_angle = std::atan2(start_v, start_u);
                                 const auto mouse_angle = std::atan2(mouse_v, mouse_u);
-                                auto sweep = mouse_angle - start_angle;
-                                while(sweep > std::acos(-1.0)) sweep -= 2.0 * std::acos(-1.0);
-                                while(sweep < -std::acos(-1.0)) sweep += 2.0 * std::acos(-1.0);
+                                // Normalize both angles to [0, 2*pi) to match the behavior of
+                                // Sketch::normalize_angle() and the final arc rendering loop,
+                                // which always sweeps counterclockwise from start to stop.
+                                const auto pi = std::acos(-1.0);
+                                auto start_norm = start_angle;
+                                auto mouse_norm = mouse_angle;
+                                while(start_norm < 0.0) start_norm += 2.0 * pi;
+                                while((2.0 * pi) <= start_norm) start_norm -= 2.0 * pi;
+                                while(mouse_norm < 0.0) mouse_norm += 2.0 * pi;
+                                while((2.0 * pi) <= mouse_norm) mouse_norm -= 2.0 * pi;
+                                auto sweep = mouse_norm - start_norm;
+                                if(sweep <= 0.0) sweep += 2.0 * pi;
                                 constexpr std::size_t segments = 48U;
                                 auto previous = start_point;
                                 for(std::size_t j = 1U; j <= segments; ++j){
-                                    const auto theta = start_angle
+                                    const auto theta = start_norm
                                                      + (sweep * static_cast<double>(j)) / static_cast<double>(segments);
                                     const auto next = centre
                                                     + preview_plane->row_unit * (std::cos(theta) * radius)
@@ -10803,7 +10825,8 @@ bool SDL_Viewer(Drover &DICOM_data,
                                                 &append_sketch_log,
                                                 &sketch_snap_distance,
                                                 &sketch_last_unresolved_constraints,
-                                                &solve_sketch_after_edit ]() -> void {
+                                                &solve_sketch_after_edit,
+                                                &apply_sketch_edit ]() -> void {
 
             std::unique_lock<std::shared_timed_mutex> drover_lock(drover_mutex, mutex_dt);
             if( !drover_lock
@@ -10923,6 +10946,7 @@ bool SDL_Viewer(Drover &DICOM_data,
                 const bool pressing_ctrl_Z = (io.KeyCtrl && ImGui::IsKeyPressed( SDL_SCANCODE_Z ));
                 const bool pressing_ctrl_Y = (io.KeyCtrl && ImGui::IsKeyPressed( SDL_SCANCODE_Y ));
                 const bool pressing_escape = ImGui::IsKeyPressed(SDL_SCANCODE_ESCAPE);
+                const bool pressing_delete = ImGui::IsKeyPressed(SDL_SCANCODE_DELETE);
 
 
                 if( image_mouse_pos_opt.value().image_window_focused
@@ -11010,6 +11034,44 @@ bool SDL_Viewer(Drover &DICOM_data,
                             slot.clear_selection();
                             slot.clear_vertex_selection();
                             clear_sketch_interaction_state();
+                        }
+
+                    }else if( view_toggles.view_vector_sketching_enabled
+                          &&  pressing_delete
+                          &&  !sketch_pending_primitive.active()
+                          &&  (sketch_tool_mode == sketch_tool_mode_t::select) ){
+                        auto &slot = current_sketch_slot();
+                        if(!slot.selection.empty() || !slot.vertex_selection.empty()){
+                            apply_sketch_edit(disp_img_it, [&](Sketch &editable_sketch){
+                                // Delete primitives first if any are selected.
+                                if(!slot.selection.empty()){
+                                    // Collect indices into a sorted vector so we can delete
+                                    // from highest index to lowest to avoid shifting.
+                                    std::vector<Sketch::primitive_index_t> to_delete(
+                                        std::begin(slot.selection), std::end(slot.selection));
+                                    std::sort(std::begin(to_delete), std::end(to_delete),
+                                              std::greater<Sketch::primitive_index_t>());
+                                    for(const auto prim_idx : to_delete){
+                                        editable_sketch.delete_primitive(prim_idx);
+                                    }
+                                }
+                                // If vertices are selected, delete all primitives connected to them.
+                                if(!slot.vertex_selection.empty()){
+                                    std::vector<Sketch::vertex_index_t> to_delete(
+                                        std::begin(slot.vertex_selection), std::end(slot.vertex_selection));
+                                    // delete_vertex also deletes connected primitives and remaps
+                                    // indices, so sort descending and iterate.
+                                    std::sort(std::begin(to_delete), std::end(to_delete),
+                                              std::greater<Sketch::vertex_index_t>());
+                                    for(const auto vtx_idx : to_delete){
+                                        editable_sketch.delete_vertex(vtx_idx);
+                                    }
+                                }
+                            });
+                            slot.selection.clear();
+                            slot.clear_vertex_selection();
+                            sketch_last_unresolved_constraints = {};
+                            append_sketch_log("Deleted selected geometry");
                         }
 
                     }else if( view_toggles.view_vector_sketching_enabled

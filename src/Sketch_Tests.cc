@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <map>
 #include <set>
 #include <vector>
 
@@ -1079,4 +1080,146 @@ TEST_CASE("Sketch extrusion stitches line loops and preserves holes in end caps"
 
     CHECK( saw_cap_face );
     CHECK( saw_annulus_face );
+}
+
+TEST_CASE("Sketch extrusion mesh has no internal faces after post-processing"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    sketch.add_circle(vec3<double>(0.0, 0.0, 0.0),
+                      vec3<double>(2.0, 0.0, 0.0),
+                      Sketch::geometry_tag_t::normal);
+
+    Sketch::extrusion_options_t options;
+    options.into_frame_length = 5.0;
+    options.out_of_frame_length = 5.0;
+    options.curve_segments = 24U;
+
+    fv_surface_mesh<double, uint64_t> mesh;
+    REQUIRE( sketch.build_extruded_surface_mesh(options, mesh) );
+    REQUIRE( !mesh.faces.empty() );
+
+    // Build edge -> face count map to check for non-manifold edges.
+    struct edge_key_t {
+        uint64_t a, b;
+        bool operator<(const edge_key_t &other) const {
+            return std::tie(a, b) < std::tie(other.a, other.b);
+        }
+    };
+    std::map<edge_key_t, std::size_t> edge_counts;
+    for(const auto &face : mesh.faces){
+        REQUIRE( face.size() == 3U );
+        for(int k = 0; k < 3; ++k){
+            edge_key_t ek{ face[k], face[(k+1) % 3] };
+            if(ek.a > ek.b) std::swap(ek.a, ek.b);
+            ++edge_counts[ek];
+        }
+    }
+
+    // Every edge should appear in at most 2 faces in a manifold mesh.
+    for(const auto &[ek, count] : edge_counts){
+        CHECK( count <= 2U );
+    }
+
+    // Face normals should be consistently oriented (cap normals point in +/- z).
+    int near_cap_faces = 0;
+    int far_cap_faces = 0;
+    for(const auto &face : mesh.faces){
+        const auto &a = mesh.vertices.at(face.at(0));
+        const auto &b = mesh.vertices.at(face.at(1));
+        const auto &c = mesh.vertices.at(face.at(2));
+        const auto normal = (b - a).Cross(c - a);
+        const bool near_cap = (std::abs(a.z + 5.0) <= 1.0E-6)
+                           && (std::abs(b.z + 5.0) <= 1.0E-6)
+                           && (std::abs(c.z + 5.0) <= 1.0E-6);
+        const bool far_cap = (std::abs(a.z - 5.0) <= 1.0E-6)
+                          && (std::abs(b.z - 5.0) <= 1.0E-6)
+                          && (std::abs(c.z - 5.0) <= 1.0E-6);
+        if(near_cap){
+            ++near_cap_faces;
+            CHECK( normal.z < 0.0 );
+        }
+        if(far_cap){
+            ++far_cap_faces;
+            CHECK( normal.z > 0.0 );
+        }
+    }
+    CHECK( near_cap_faces > 0 );
+    CHECK( far_cap_faces > 0 );
+}
+
+TEST_CASE("Sketch tangent constraint with arc and line converges reliably"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    // Arc at origin, radius 1.5, spanning 0 to pi/2.
+    const auto arc_idx = sketch.add_arc(vec3<double>(0.0, 0.0, 0.0),
+                                        vec3<double>(1.5, 0.0, 0.0),
+                                        vec3<double>(0.0, 1.5, 0.0),
+                                        Sketch::geometry_tag_t::normal);
+    // Line far from tangency initially.
+    const auto line_idx = sketch.add_line(vec3<double>(-3.0, 2.0, 0.0),
+                                          vec3<double>(3.0, 2.0, 0.0),
+                                          Sketch::geometry_tag_t::normal);
+
+    const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(sketch.primitive(arc_idx));
+    const auto *line = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(line_idx));
+    REQUIRE( arc != nullptr );
+    REQUIRE( line != nullptr );
+
+    // Pin only the arc centre.
+    sketch.add_pin_constraint(arc->center);
+    sketch.add_tangent_constraint(arc_idx, line_idx);
+
+    Sketch::solve_options_t options;
+    options.max_iterations = 256U;
+    const auto unresolved = sketch.solve_constraints(options);
+    REQUIRE( unresolved == 0U );
+
+    // The distance from the arc centre to the line should equal the arc radius.
+    const auto centre = sketch.vertex(arc->center);
+    const auto p0 = sketch.vertex(line->vertices[0]);
+    const auto p1 = sketch.vertex(line->vertices[1]);
+    const auto radius = centre.distance(sketch.vertex(arc->start));
+    const auto cross = std::abs(((centre.x - p0.x) * (p1.y - p0.y)) - ((centre.y - p0.y) * (p1.x - p0.x)));
+    const auto denom = std::hypot(p1.x - p0.x, p1.y - p0.y);
+    REQUIRE( denom > 1.0E-9 );
+    CHECK( doctest::Approx(cross / denom).epsilon(1E-4) == radius );
+
+    // Arc should not have shrunk below its initial radius.
+    CHECK( radius >= 1.49 );
+}
+
+TEST_CASE("Sketch delete key removes selected primitives"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    const auto line_a = sketch.add_line(vec3<double>(0.0, 0.0, 0.0),
+                                        vec3<double>(1.0, 0.0, 0.0),
+                                        Sketch::geometry_tag_t::normal);
+    const auto line_b = sketch.add_line(vec3<double>(0.0, 1.0, 0.0),
+                                        vec3<double>(1.0, 1.0, 0.0),
+                                        Sketch::geometry_tag_t::normal);
+    REQUIRE( sketch.primitive_count() == 2U );
+
+    // delete_primitive removes a single primitive.
+    REQUIRE( sketch.delete_primitive(line_a) );
+    REQUIRE( sketch.primitive_count() == 1U );
+    const auto *remaining = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(0U));
+    REQUIRE( remaining != nullptr );
+    REQUIRE( remaining->vertices[0] == 2U ); // Remapped vertex index.
+    REQUIRE( remaining->vertices[1] == 3U );
+}
+
+TEST_CASE("Sketch delete vertex removes connected primitives"){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    const auto shared = sketch.append_vertex(vec3<double>(0.0, 0.0, 0.0));
+    const auto far_a = sketch.append_vertex(vec3<double>(1.0, 0.0, 0.0));
+    const auto far_b = sketch.append_vertex(vec3<double>(0.0, 1.0, 0.0));
+    sketch.add_line(shared, far_a, Sketch::geometry_tag_t::normal);
+    sketch.add_line(shared, far_b, Sketch::geometry_tag_t::normal);
+    REQUIRE( sketch.primitive_count() == 2U );
+
+    // Deleting the shared vertex removes both connected primitives.
+    REQUIRE( sketch.delete_vertex(shared) );
+    REQUIRE( sketch.primitive_count() == 0U );
+    REQUIRE( sketch.vertex_count() == 2U ); // Two unconnected vertices remain.
 }

@@ -398,6 +398,157 @@ static void append_triangle(fv_surface_mesh<double, uint64_t> &mesh,
     mesh.faces.emplace_back(std::vector<uint64_t>{ a, b, c });
 }
 
+// Post-process an extruded surface mesh to remove internal faces and ensure
+// consistent normal orientation. Internal faces are those whose edges are
+// shared by 3+ faces (non-manifold T-junctions). Among such faces, we keep
+// the two with the most distinct normals (i.e., the outer surface pair) and
+// discard the rest. After cleanup, face normals are re-oriented to be
+// consistent across the mesh, pointing outward from the interior.
+static void remove_internal_mesh_faces(fv_surface_mesh<double, uint64_t> &mesh){
+    // Edge key: sorted pair of vertex indices.
+    struct edge_key_t {
+        uint64_t a, b;
+        bool operator<(const edge_key_t &other) const {
+            return std::tie(a, b) < std::tie(other.a, other.b);
+        }
+    };
+
+    // 1. Build edge -> list of face indices.
+    std::map<edge_key_t, std::vector<std::size_t>> edge_faces;
+    for(std::size_t fi = 0U; fi < mesh.faces.size(); ++fi){
+        const auto &f = mesh.faces[fi];
+        if(f.size() != 3U) continue;
+        for(int k = 0; k < 3; ++k){
+            edge_key_t ek{ f[k], f[(k+1) % 3] };
+            if(ek.a > ek.b) std::swap(ek.a, ek.b);
+            edge_faces[ek].push_back(fi);
+        }
+    }
+
+    // Helper to compute face normal.
+    auto face_normal = [&](std::size_t fi) -> vec3<double> {
+        const auto &f = mesh.faces[fi];
+        const auto &v0 = mesh.vertices[ f[0] ];
+        const auto &v1 = mesh.vertices[ f[1] ];
+        const auto &v2 = mesh.vertices[ f[2] ];
+        return (v1 - v0).Cross(v2 - v0);
+    };
+
+    // Track which faces to remove.
+    std::vector<bool> keep(mesh.faces.size(), true);
+
+    // 2. Find non-manifold edges (3+ incident faces) and remove extra faces.
+    for(const auto &[ek, fis] : edge_faces){
+        if(fis.size() < 3U) continue;
+        // For N > 2 faces on one edge, keep the 2 faces whose normals differ
+        // the most (they form the outer surface). Remove the rest.
+        std::size_t best_i = 0U, best_j = 1U;
+        double min_dot = 1.0;
+        for(std::size_t ii = 0U; ii < fis.size(); ++ii){
+            const auto ni = face_normal(fis[ii]).unit();
+            for(std::size_t jj = ii + 1U; jj < fis.size(); ++jj){
+                const auto nj = face_normal(fis[jj]).unit();
+                const auto d = std::abs(ni.Dot(nj));
+                if(d < min_dot){
+                    min_dot = d;
+                    best_i = ii;
+                    best_j = jj;
+                }
+            }
+        }
+        for(std::size_t ii = 0U; ii < fis.size(); ++ii){
+            if((ii != best_i) && (ii != best_j)){
+                keep[fis[ii]] = false;
+            }
+        }
+    }
+
+    // 3. Remove flagged faces and always swap to restore moved-from entries.
+    std::vector<std::vector<uint64_t>> new_faces;
+    new_faces.reserve(mesh.faces.size());
+    for(std::size_t fi = 0U; fi < mesh.faces.size(); ++fi){
+        if(keep[fi]){
+            new_faces.push_back(std::move(mesh.faces[fi]));
+        }
+    }
+    mesh.faces.swap(new_faces);
+
+    // 4. Ensure consistent face orientation via flood-fill propagation.
+    if(mesh.faces.empty()) return;
+
+    // Rebuild edge->face adjacency for the cleaned mesh.
+    edge_faces.clear();
+    for(std::size_t fi = 0U; fi < mesh.faces.size(); ++fi){
+        const auto &f = mesh.faces[fi];
+        if(f.size() != 3U) continue;
+        for(int k = 0; k < 3; ++k){
+            edge_key_t ek{ f[k], f[(k+1) % 3] };
+            if(ek.a > ek.b) std::swap(ek.a, ek.b);
+            edge_faces[ek].push_back(fi);
+        }
+    }
+
+    // BFS seed from first face (arbitrary orientation).
+    std::vector<int8_t> orientation(mesh.faces.size(), 0); // 0=unset, 1=keep, -1=reverse
+    orientation[0] = 1;
+
+    // For BFS we need face adjacency from shared edges.
+    // Build adjacency in a simpler way: for each edge, if exactly 2 faces,
+    // add adjacency entries.
+    std::vector<std::vector<std::size_t>> adj(mesh.faces.size());
+    for(const auto &[ek, fis] : edge_faces){
+        if(fis.size() == 2U){
+            adj[fis[0]].push_back(fis[1]);
+            adj[fis[1]].push_back(fis[0]);
+        }
+    }
+
+    std::vector<std::size_t> stack;
+    stack.reserve(mesh.faces.size());
+    stack.push_back(0U);
+    while(!stack.empty()){
+        const auto fi = stack.back();
+        stack.pop_back();
+        const auto &f = mesh.faces[fi];
+        for(const auto nfi : adj[fi]){
+            if(orientation[nfi] != 0) continue;
+            const auto &nf = mesh.faces[nfi];
+            // Find the shared edge (pair of consecutive vertices in both faces).
+            bool found = false;
+            for(int fk = 0; fk < 3 && !found; ++fk){
+                auto fv0 = f[fk];
+                auto fv1 = f[(fk+1) % 3];
+                if(fv0 > fv1) std::swap(fv0, fv1);
+                for(int nk = 0; nk < 3; ++nk){
+                    auto nv0 = nf[nk];
+                    auto nv1 = nf[(nk+1) % 3];
+                    if(nv0 > nv1) std::swap(nv0, nv1);
+                    if(fv0 == nv0 && fv1 == nv1){
+                        // Check if the edge is traversed in opposite directions.
+                        // In face f: edge from f[fk] to f[(fk+1)%3].
+                        // In face nf: edge from nf[nk] to nf[(nk+1)%3].
+                        // If consistent, the winding should be opposite.
+                        const bool same_dir = (f[fk] == nf[nk] && f[(fk+1) % 3] == nf[(nk+1) % 3]);
+                        orientation[nfi] = same_dir ? (-orientation[fi]) : orientation[fi];
+                        stack.push_back(nfi);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Flip faces with negative orientation.
+    for(std::size_t fi = 0U; fi < mesh.faces.size(); ++fi){
+        if(orientation[fi] < 0){
+            std::reverse(std::begin(mesh.faces[fi]), std::end(mesh.faces[fi]));
+        }
+    }
+
+    mesh.recreate_involved_face_index();
+}
+
 struct extruded_path_t {
     std::vector<vec3<double>> points;
     bool closed = false;
@@ -2778,6 +2929,49 @@ Sketch::solve_constraints(const solve_options_t &options){
             initial_state.at(base_contact + 1U) = contact_v;
             initial_state.at(base_other)     = other_on_tangent_u;
             initial_state.at(base_other + 1U) = other_on_tangent_v;
+
+            // Also move the round primitive's vertex nearest the contact point to the
+            // tangent location. This prevents the round (e.g., arc) from shrinking
+            // during LM solving by anchoring its radius at the correct tangent point.
+            // The round's radius_point is its start vertex for arcs, or the radius_point
+            // for circles. Whichever round vertex is closest to the tangent point is
+            // repositioned there so the round already passes through the tangent point
+            // at the correct radius.
+            {
+                const auto rp_vert = round->radius_point;
+                // Determine which round endpoint is nearer the line contact point.
+                const auto rp_proj = context.projected_vertex(initial_state, rp_vert);
+                const auto dist_rp = projected_distance(rp_proj, { contact_u, contact_v });
+                // For arcs, also check the stop vertex distance.
+                std::optional<Sketch::vertex_index_t> stop_vert;
+                double dist_stop = std::numeric_limits<double>::max();
+                if(const auto *arc = dynamic_cast<const arc_primitive_t*>(
+                        primitive(tangent->primitive_a));
+                   arc != nullptr){
+                    stop_vert = arc->stop;
+                }else if(const auto *arc = dynamic_cast<const arc_primitive_t*>(
+                             primitive(tangent->primitive_b));
+                         arc != nullptr){
+                    stop_vert = arc->stop;
+                }
+                if(stop_vert && vertex_index_valid(*stop_vert)){
+                    // Ensure the stop vertex is also tracked in initial_state.
+                    const auto stop_proj = context.projected_vertex(initial_state, *stop_vert);
+                    dist_stop = projected_distance(stop_proj, { contact_u, contact_v });
+                }
+                // The round vertex we will move: the one nearest the tangent contact point.
+                auto round_vertex_to_move = rp_vert;
+                if(stop_vert && (dist_stop < dist_rp)){
+                    round_vertex_to_move = *stop_vert;
+                }
+                // Only move this vertex if it is not one of the line's vertices (which
+                // were already moved above), to avoid overwriting those positions.
+                if((round_vertex_to_move != contact_vertex) && (round_vertex_to_move != other_vertex)){
+                    const auto base_rv = round_vertex_to_move * 2U;
+                    initial_state.at(base_rv)     = contact_u;
+                    initial_state.at(base_rv + 1U) = contact_v;
+                }
+            }
         }
     }
 
@@ -3239,6 +3433,13 @@ Sketch::build_extruded_surface_mesh(const extrusion_options_t &options,
             return false;
         }
         mesh.recreate_involved_face_index();
+
+        // Post-process the extruded mesh to remove internal faces and ensure
+        // consistent normal orientation. Internal faces are detected as faces
+        // whose edges are all shared by at least two faces. Such faces do not
+        // contribute to the exterior surface and make the mesh non-manifold.
+        remove_internal_mesh_faces(mesh);
+
         return true;
     }catch(const std::exception &e){
         YLOGWARN("Sketch extrusion failed with exception: '" << e.what() << "'");
