@@ -230,6 +230,7 @@ struct opengl_mesh {
     GLsizei N_indices = 0;
     GLsizei N_vertices = 0;
     GLsizei N_triangles = 0;
+    int64_t N_euler = 0;
 
     // Constructor. Allocates space in GPU memory.
     opengl_mesh( const fv_surface_mesh<double, uint64_t> &meshes,
@@ -241,6 +242,28 @@ struct opengl_mesh {
             int64_t l_N_indices = f.size();
             if(l_N_indices < 3) continue; // Ignore faces that cannot be broken into triangles.
             this->N_triangles += static_cast<GLsizei>(l_N_indices - 2);
+        }
+        // Euler characteristic: V - E + F for a surface mesh.
+        // Count unique edges by collecting sorted vertex pairs from all faces.
+        {
+            struct edge_pair_t {
+                uint64_t a, b;
+                bool operator<(const edge_pair_t &other) const {
+                    return std::tie(a, b) < std::tie(other.a, other.b);
+                }
+            };
+            std::set<edge_pair_t> unique_edges;
+            for(const auto &f : meshes.faces){
+                for(std::size_t k = 0U; k < f.size(); ++k){
+                    auto v0 = f[k];
+                    auto v1 = f[(k + 1U) % f.size()];
+                    if(v0 > v1) std::swap(v0, v1);
+                    unique_edges.insert(edge_pair_t{v0, v1});
+                }
+            }
+            this->N_euler = static_cast<int64_t>(this->N_vertices)
+                          - static_cast<int64_t>(unique_edges.size())
+                          + static_cast<int64_t>(meshes.faces.size());
         }
         const auto N_vert_normals = static_cast<GLsizei>(meshes.vertex_normals.size());
         const bool has_vert_normals = (N_vert_normals == this->N_vertices);
@@ -444,7 +467,7 @@ struct opengl_mesh {
 
         // Reset accessible class state for good measure.
         this->ebo = this->vbo = this->nbo = this->vao = 0;
-        this->N_triangles = this->N_indices = this->N_vertices = 0;
+        this->N_triangles = this->N_indices = this->N_vertices = this->N_euler = 0;
     };
 };
 
@@ -1778,7 +1801,7 @@ bool SDL_Viewer(Drover &DICOM_data,
     };
     Sketch::solve_options_t sketch_solve_options = make_default_sketch_solve_options();
     bool sketch_solve_on_edit = true;
-    bool sketch_constrain_to_image_frame = true;
+    bool sketch_constrain_to_image_frame = false; // Can slow down mouse interaction with sketches
     double sketch_snap_distance = 5.0;
     double sketch_extrude_into_frame = 10.0;
     double sketch_extrude_out_of_frame = 10.0;
@@ -1977,14 +2000,13 @@ bool SDL_Viewer(Drover &DICOM_data,
         return options;
     };
     const auto append_sketch_summary_log = [&](const Sketch &sketch) -> void {
+        append_sketch_log("---");
         const auto dof = sketch.summarize_degrees_of_freedom();
         {   // Timestamp for this constraint solve.
             const auto now = std::chrono::system_clock::now();
             const auto t = std::chrono::system_clock::to_time_t(now);
-            std::tm tm_buf;
-            localtime_r(&t, &tm_buf);
             std::stringstream ss;
-            ss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S");
+            ss << ygor::get_localtime_str(t);
             append_sketch_log("Solve timestamp: " + ss.str());
         }
         append_sketch_log("Geometry: " + std::to_string(sketch.primitive_count())
@@ -11755,11 +11777,18 @@ bool SDL_Viewer(Drover &DICOM_data,
                         }
                     }
 
-                    std::string msg = "Drawing "_s
-                                    + std::to_string(oglm_ptr->N_vertices) + " vertices, "
-                                    + std::to_string(oglm_ptr->N_indices) + " indices, and "
-                                    + std::to_string(oglm_ptr->N_triangles) + " triangles.";
-                    ImGui::Text("%s", msg.c_str());
+                    {
+                        std::string msg = "Drawing "_s
+                                        + std::to_string(oglm_ptr->N_vertices) + " vertices, "
+                                        + std::to_string(oglm_ptr->N_indices) + " indices, and "
+                                        + std::to_string(oglm_ptr->N_triangles) + " triangles.";
+                        ImGui::Text("%s", msg.c_str());
+                    }
+
+                    {
+                        std::string msg = "Euler characteristic: " + std::to_string(oglm_ptr->N_euler) + ".";
+                        ImGui::Text("%s", msg.c_str());
+                    }
 
                     auto scroll_meshes = static_cast<int>(mesh_num);
                     ImGui::SliderInt("Mesh", &scroll_meshes, 0, N_meshes - 1);

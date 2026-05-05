@@ -1,10 +1,10 @@
 //Sketch.cc - A part of DICOMautomaton 2026. Written by hal clark.
 
 #include "Sketch.h"
+#include "Sketch_Constraints.h"
 
 #include <algorithm>
 #include <cmath>
-#include <chrono>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -14,23 +14,9 @@
 #include <stdexcept>
 #include <tuple>
 
-#ifdef DCMA_USE_EIGEN
-    #include <eigen3/Eigen/Dense>
-    #include <eigen3/Eigen/SVD>
-    #include <eigen3/Eigen/Sparse>
-#endif // DCMA_USE_EIGEN
-
-#include "YgorMathDelaunay.h"
 #include "YgorLog.h"
-#include "YgorOptimizeLM.h"
 
 namespace {
-
-constexpr double solver_min_epsilon = 1.0E-9;
-constexpr double jacobian_sparsity_threshold = 1.0E-12;
-constexpr std::size_t max_refinement_passes = 8U;
-// C++17 does not provide std::numbers::pi, so keep a local constant for the taper helpers below.
-constexpr double pi_constant = 3.1415926535897931;
 
 Sketch::projection_t cubic_bezier_point(const Sketch::projection_t &p0,
                                         const Sketch::projection_t &p1,
@@ -188,34 +174,6 @@ static Sketch::projection_t lerp(const Sketch::projection_t &a,
              a.v + (b.v - a.v) * t };
 }
 
-static Sketch::projection_t reflect_across_line(const Sketch::projection_t &point,
-                                                const Sketch::projection_t &line_a,
-                                                const Sketch::projection_t &line_b){
-    const auto ab_u = line_b.u - line_a.u;
-    const auto ab_v = line_b.v - line_a.v;
-    const auto denom = (ab_u * ab_u) + (ab_v * ab_v);
-    if(denom <= std::numeric_limits<double>::epsilon()){
-        return point;
-    }
-
-    const auto ap_u = point.u - line_a.u;
-    const auto ap_v = point.v - line_a.v;
-    const auto t = ((ap_u * ab_u) + (ap_v * ab_v)) / denom;
-    const Sketch::projection_t closest = { line_a.u + t * ab_u, line_a.v + t * ab_v };
-    return { 2.0 * closest.u - point.u, 2.0 * closest.v - point.v };
-}
-
-static std::pair<double, double> orient_unit_direction(double ref_u,
-                                                       double ref_v,
-                                                       double candidate_u,
-                                                       double candidate_v){
-    if(((ref_u * candidate_u) + (ref_v * candidate_v)) < 0.0){
-        candidate_u = -candidate_u;
-        candidate_v = -candidate_v;
-    }
-    return std::make_pair(candidate_u, candidate_v);
-}
-
 static double nearest_cubic_bezier_parameter(const Sketch::projection_t &query,
                                              const Sketch::projection_t &p0,
                                              const Sketch::projection_t &p1,
@@ -236,135 +194,6 @@ static double nearest_cubic_bezier_parameter(const Sketch::projection_t &query,
     return best_t;
 }
 
-static std::size_t constraint_dof_contribution(const Sketch::constraint_t &constraint){
-    switch(constraint.kind()){
-        case Sketch::constraint_kind_t::horizontal:
-        case Sketch::constraint_kind_t::vertical:
-        case Sketch::constraint_kind_t::distance:
-        case Sketch::constraint_kind_t::parallel:
-        case Sketch::constraint_kind_t::perpendicular:
-        case Sketch::constraint_kind_t::tangent:
-            return 1U;
-        case Sketch::constraint_kind_t::pin:
-        case Sketch::constraint_kind_t::mirror:
-        case Sketch::constraint_kind_t::overlap:
-            return 2U;
-    }
-    return 0U;
-}
-
-struct residual_block_t {
-    std::size_t constraint_idx = 0U;
-    std::size_t begin = 0U;
-    std::size_t count = 0U;
-    bool sticky = false;
-};
-
-struct line_binding_t {
-    Sketch::vertex_index_t a = 0U;
-    Sketch::vertex_index_t b = 0U;
-};
-
-struct round_binding_t {
-    Sketch::vertex_index_t center = 0U;
-    Sketch::vertex_index_t radius_point = 0U;
-};
-
-struct tangent_descriptor_t {
-    enum class mode_t {
-        unsupported,
-        line_round,
-        round_round_external,
-        round_round_internal,
-    };
-
-    mode_t mode = mode_t::unsupported;
-    double internal_sign = 1.0;
-};
-
-static void append_residual_block(std::vector<double> &residuals,
-                                  std::vector<residual_block_t> *blocks,
-                                  std::size_t constraint_idx,
-                                  std::initializer_list<double> values,
-                                  bool sticky = false){
-    const auto begin = residuals.size();
-    residuals.insert(std::end(residuals), std::begin(values), std::end(values));
-    if(blocks != nullptr){
-        residual_block_t block;
-        block.constraint_idx = constraint_idx;
-        block.begin = begin;
-        block.count = values.size();
-        block.sticky = sticky;
-        blocks->push_back(block);
-    }
-}
-
-static std::optional<line_binding_t> get_line_binding(const Sketch &sketch,
-                                                      Sketch::primitive_index_t primitive_idx){
-    const auto *line = dynamic_cast<const Sketch::line_primitive_t*>(sketch.primitive(primitive_idx));
-    if(line == nullptr) return {};
-    return line_binding_t{ line->vertices[0], line->vertices[1] };
-}
-
-static std::optional<round_binding_t> get_round_binding(const Sketch &sketch,
-                                                        Sketch::primitive_index_t primitive_idx){
-    if(const auto *circle = dynamic_cast<const Sketch::circle_primitive_t*>(sketch.primitive(primitive_idx)); circle != nullptr){
-        return round_binding_t{ circle->center, circle->radius_point };
-    }
-    if(const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(sketch.primitive(primitive_idx)); arc != nullptr){
-        return round_binding_t{ arc->center, arc->start };
-    }
-    return {};
-}
-
-static double signed_distance_to_line(const Sketch::projection_t &point,
-                                      const Sketch::projection_t &line_a,
-                                      const Sketch::projection_t &line_b){
-    const auto du = line_b.u - line_a.u;
-    const auto dv = line_b.v - line_a.v;
-    const auto denom = std::hypot(du, dv);
-    if(denom <= std::numeric_limits<double>::epsilon()){
-        const auto offset_u = point.u - line_a.u;
-        const auto offset_v = point.v - line_a.v;
-        const auto magnitude = std::hypot(offset_u, offset_v);
-        const auto sign_basis = (std::abs(offset_v) >= std::abs(offset_u)) ? offset_v : offset_u;
-        return std::copysign(magnitude, (sign_basis == 0.0) ? 1.0 : sign_basis);
-    }
-    return ((point.u - line_a.u) * dv - (point.v - line_a.v) * du) / denom;
-}
-
-static double projected_distance(const Sketch::projection_t &a,
-                                 const Sketch::projection_t &b){
-    return std::hypot(a.u - b.u, a.v - b.v);
-}
-
-static double extrusion_scale_factor(double reference_half_extent,
-                                     double extrusion_length,
-                                     double angle_degrees){
-    // Convert a taper angle into a uniform in-plane cap scale. A return value of 1.0 preserves
-    // the original cap size; values above 1.0 expand it; values below 1.0 narrow it; NaN signals
-    // invalid non-finite input values that should be rejected by the caller.
-    if(reference_half_extent <= solver_min_epsilon) return 1.0;
-    if(!std::isfinite(extrusion_length) || !std::isfinite(angle_degrees)){
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    if(std::abs(angle_degrees) <= solver_min_epsilon) return 1.0;
-    const auto angle_radians = angle_degrees * (pi_constant / 180.0);
-    const auto delta = std::tan(angle_radians) * std::abs(extrusion_length);
-    return (reference_half_extent + delta) / reference_half_extent;
-}
-
-static Sketch::projection_t scale_projection_about(const Sketch::projection_t &point,
-                                                   const Sketch::projection_t &centre,
-                                                   double scale){
-    // Uniformly scale a 2D projected point about the sketch bounding-box centre before lifting it
-    // back into 3D, which keeps tapering centred on the original sketch footprint.
-    return {
-        centre.u + ((point.u - centre.u) * scale),
-        centre.v + ((point.v - centre.v) * scale)
-    };
-}
-
 static Sketch::projection_t clamp_to_bounds(const Sketch::projection_t &p,
                                             const Sketch::bounding_box_t &bounds){
     return {
@@ -372,917 +201,6 @@ static Sketch::projection_t clamp_to_bounds(const Sketch::projection_t &p,
         std::clamp(p.v, bounds.min.v, bounds.max.v)
     };
 }
-
-static double signed_polygon_area(const std::vector<Sketch::projection_t> &points){
-    if(points.size() < 3U) return 0.0;
-    double twice_area = 0.0;
-    for(std::size_t i = 0U; i < points.size(); ++i){
-        const auto &a = points.at(i);
-        const auto &b = points.at((i + 1U) % points.size());
-        twice_area += (a.u * b.v) - (b.u * a.v);
-    }
-    return twice_area * 0.5;
-}
-
-static bool points_coincident(const vec3<double> &a,
-                              const vec3<double> &b,
-                              double tolerance = 1.0E-6){
-    return a.distance(b) <= tolerance;
-}
-
-static void append_triangle(fv_surface_mesh<double, uint64_t> &mesh,
-                            uint64_t a,
-                            uint64_t b,
-                            uint64_t c){
-    if((a == b) || (b == c) || (a == c)) return;
-    mesh.faces.emplace_back(std::vector<uint64_t>{ a, b, c });
-}
-
-// Post-process an extruded surface mesh to remove internal faces and ensure
-// consistent normal orientation. Internal faces are those whose edges are
-// shared by 3+ faces (non-manifold T-junctions). Among such faces, we keep
-// the two with the most distinct normals (i.e., the outer surface pair) and
-// discard the rest. After cleanup, face normals are re-oriented to be
-// consistent across the mesh, pointing outward from the interior.
-static void remove_internal_mesh_faces(fv_surface_mesh<double, uint64_t> &mesh){
-    // Edge key: sorted pair of vertex indices.
-    struct edge_key_t {
-        uint64_t a, b;
-        bool operator<(const edge_key_t &other) const {
-            return std::tie(a, b) < std::tie(other.a, other.b);
-        }
-    };
-
-    // 1. Build edge -> list of face indices.
-    std::map<edge_key_t, std::vector<std::size_t>> edge_faces;
-    for(std::size_t fi = 0U; fi < mesh.faces.size(); ++fi){
-        const auto &f = mesh.faces[fi];
-        if(f.size() != 3U) continue;
-        for(int k = 0; k < 3; ++k){
-            edge_key_t ek{ f[k], f[(k+1) % 3] };
-            if(ek.a > ek.b) std::swap(ek.a, ek.b);
-            edge_faces[ek].push_back(fi);
-        }
-    }
-
-    // Helper to compute face normal.
-    auto face_normal = [&](std::size_t fi) -> vec3<double> {
-        const auto &f = mesh.faces[fi];
-        const auto &v0 = mesh.vertices[ f[0] ];
-        const auto &v1 = mesh.vertices[ f[1] ];
-        const auto &v2 = mesh.vertices[ f[2] ];
-        return (v1 - v0).Cross(v2 - v0);
-    };
-
-    // Track which faces to remove.
-    std::vector<bool> keep(mesh.faces.size(), true);
-
-    // 2. Find non-manifold edges (3+ incident faces) and remove extra faces.
-    for(const auto &[ek, fis] : edge_faces){
-        if(fis.size() < 3U) continue;
-        // For N > 2 faces on one edge, keep the 2 faces whose normals differ
-        // the most (they form the outer surface). Remove the rest.
-        std::size_t best_i = 0U, best_j = 1U;
-        double min_dot = 1.0;
-        for(std::size_t ii = 0U; ii < fis.size(); ++ii){
-            const auto ni = face_normal(fis[ii]).unit();
-            for(std::size_t jj = ii + 1U; jj < fis.size(); ++jj){
-                const auto nj = face_normal(fis[jj]).unit();
-                const auto d = std::abs(ni.Dot(nj));
-                if(d < min_dot){
-                    min_dot = d;
-                    best_i = ii;
-                    best_j = jj;
-                }
-            }
-        }
-        for(std::size_t ii = 0U; ii < fis.size(); ++ii){
-            if((ii != best_i) && (ii != best_j)){
-                keep[fis[ii]] = false;
-            }
-        }
-    }
-
-    // 3. Remove flagged faces and always swap to restore moved-from entries.
-    std::vector<std::vector<uint64_t>> new_faces;
-    new_faces.reserve(mesh.faces.size());
-    for(std::size_t fi = 0U; fi < mesh.faces.size(); ++fi){
-        if(keep[fi]){
-            new_faces.push_back(std::move(mesh.faces[fi]));
-        }
-    }
-    mesh.faces.swap(new_faces);
-
-    // 4. Ensure consistent face orientation via flood-fill propagation.
-    if(mesh.faces.empty()) return;
-
-    // Rebuild edge->face adjacency for the cleaned mesh.
-    edge_faces.clear();
-    for(std::size_t fi = 0U; fi < mesh.faces.size(); ++fi){
-        const auto &f = mesh.faces[fi];
-        if(f.size() != 3U) continue;
-        for(int k = 0; k < 3; ++k){
-            edge_key_t ek{ f[k], f[(k+1) % 3] };
-            if(ek.a > ek.b) std::swap(ek.a, ek.b);
-            edge_faces[ek].push_back(fi);
-        }
-    }
-
-    // BFS seed from first face (arbitrary orientation).
-    std::vector<int8_t> orientation(mesh.faces.size(), 0); // 0=unset, 1=keep, -1=reverse
-    orientation[0] = 1;
-
-    // For BFS we need face adjacency from shared edges.
-    // Build adjacency in a simpler way: for each edge, if exactly 2 faces,
-    // add adjacency entries.
-    std::vector<std::vector<std::size_t>> adj(mesh.faces.size());
-    for(const auto &[ek, fis] : edge_faces){
-        if(fis.size() == 2U){
-            adj[fis[0]].push_back(fis[1]);
-            adj[fis[1]].push_back(fis[0]);
-        }
-    }
-
-    std::vector<std::size_t> stack;
-    stack.reserve(mesh.faces.size());
-    stack.push_back(0U);
-    while(!stack.empty()){
-        const auto fi = stack.back();
-        stack.pop_back();
-        const auto &f = mesh.faces[fi];
-        for(const auto nfi : adj[fi]){
-            if(orientation[nfi] != 0) continue;
-            const auto &nf = mesh.faces[nfi];
-            // Find the shared edge (pair of consecutive vertices in both faces).
-            bool found = false;
-            for(int fk = 0; fk < 3 && !found; ++fk){
-                auto fv0 = f[fk];
-                auto fv1 = f[(fk+1) % 3];
-                if(fv0 > fv1) std::swap(fv0, fv1);
-                for(int nk = 0; nk < 3; ++nk){
-                    auto nv0 = nf[nk];
-                    auto nv1 = nf[(nk+1) % 3];
-                    if(nv0 > nv1) std::swap(nv0, nv1);
-                    if(fv0 == nv0 && fv1 == nv1){
-                        // Check if the edge is traversed in opposite directions.
-                        // In face f: edge from f[fk] to f[(fk+1)%3].
-                        // In face nf: edge from nf[nk] to nf[(nk+1)%3].
-                        // If consistent, the winding should be opposite.
-                        const bool same_dir = (f[fk] == nf[nk] && f[(fk+1) % 3] == nf[(nk+1) % 3]);
-                        orientation[nfi] = same_dir ? (-orientation[fi]) : orientation[fi];
-                        stack.push_back(nfi);
-                        found = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Flip faces with negative orientation.
-    for(std::size_t fi = 0U; fi < mesh.faces.size(); ++fi){
-        if(orientation[fi] < 0){
-            std::reverse(std::begin(mesh.faces[fi]), std::end(mesh.faces[fi]));
-        }
-    }
-
-    mesh.recreate_involved_face_index();
-}
-
-struct extruded_path_t {
-    std::vector<vec3<double>> points;
-    bool closed = false;
-};
-
-static std::vector<vec3<double>> deduplicate_polyline_points(const std::vector<vec3<double>> &polyline,
-                                                             bool *closed_out = nullptr){
-    std::vector<vec3<double>> out;
-    out.reserve(polyline.size());
-    for(const auto &point : polyline){
-        if(out.empty() || !points_coincident(out.back(), point)){
-            out.push_back(point);
-        }
-    }
-
-    bool closed = false;
-    if((out.size() >= 2U) && points_coincident(out.front(), out.back())){
-        out.pop_back();
-        closed = true;
-    }
-    if(closed_out != nullptr) *closed_out = closed;
-    return out;
-}
-
-static std::vector<Sketch::projection_t> project_polyline(const Sketch &sketch,
-                                                          const std::vector<vec3<double>> &polyline){
-    std::vector<Sketch::projection_t> out;
-    out.reserve(polyline.size());
-    for(const auto &point : polyline){
-        out.push_back(sketch.project(point));
-    }
-    return out;
-}
-
-static Sketch::bounding_box_t projected_path_bounds(const Sketch &sketch,
-                                                    const std::vector<extruded_path_t> &paths){
-    Sketch::bounding_box_t bounds;
-    for(const auto &path : paths){
-        for(const auto &point : path.points){
-            const auto projected = sketch.project(point);
-            bounds.min.u = std::min(bounds.min.u, projected.u);
-            bounds.min.v = std::min(bounds.min.v, projected.v);
-            bounds.max.u = std::max(bounds.max.u, projected.u);
-            bounds.max.v = std::max(bounds.max.v, projected.v);
-        }
-    }
-    return bounds;
-}
-
-static double signed_triangle_area2(const Sketch::projection_t &a,
-                                    const Sketch::projection_t &b,
-                                    const Sketch::projection_t &c){
-    return ((b.u - a.u) * (c.v - a.v)) - ((b.v - a.v) * (c.u - a.u));
-}
-
-static bool point_on_segment(const Sketch::projection_t &p,
-                             const Sketch::projection_t &a,
-                             const Sketch::projection_t &b,
-                             double tolerance = 1.0E-8){
-    const auto cross = signed_triangle_area2(a, b, p);
-    if(std::abs(cross) > tolerance) return false;
-    const auto dot = ((p.u - a.u) * (p.u - b.u)) + ((p.v - a.v) * (p.v - b.v));
-    return dot <= tolerance;
-}
-
-static bool point_in_polygon(const Sketch::projection_t &p,
-                             const std::vector<Sketch::projection_t> &polygon){
-    if(polygon.size() < 3U) return false;
-    bool inside = false;
-    constexpr double tolerance = 1.0E-8;
-    for(std::size_t i = 0U, j = polygon.size() - 1U; i < polygon.size(); j = i++){
-        const auto &a = polygon.at(j);
-        const auto &b = polygon.at(i);
-        if(point_on_segment(p, a, b)) return true;
-        if(std::abs(b.v - a.v) <= tolerance) continue;
-        const bool intersects = ((a.v > p.v) != (b.v > p.v))
-                             && (p.u < ((b.u - a.u) * (p.v - a.v) / (b.v - a.v)) + a.u);
-        if(intersects) inside = !inside;
-    }
-    return inside;
-}
-
-static bool point_in_filled_loops(const Sketch::projection_t &p,
-                                  const std::vector<std::vector<Sketch::projection_t>> &loops){
-    std::size_t containing_loops = 0U;
-    for(const auto &loop : loops){
-        if(point_in_polygon(p, loop)){
-            ++containing_loops;
-        }
-    }
-    return ((containing_loops % 2U) == 1U);
-}
-
-static bool edge_midpoints_inside_filled_loops(const Sketch::projection_t &a,
-                                               const Sketch::projection_t &b,
-                                               const Sketch::projection_t &c,
-                                               const std::vector<std::vector<Sketch::projection_t>> &loops){
-    const std::array<Sketch::projection_t, 3> midpoints = {{
-        { (a.u + b.u) * 0.5, (a.v + b.v) * 0.5 },
-        { (b.u + c.u) * 0.5, (b.v + c.v) * 0.5 },
-        { (c.u + a.u) * 0.5, (c.v + a.v) * 0.5 }
-    }};
-    return std::all_of(std::begin(midpoints), std::end(midpoints), [&](const auto &midpoint){
-        return point_in_filled_loops(midpoint, loops);
-    });
-}
-
-static bool merge_extruded_paths(extruded_path_t &lhs,
-                                 extruded_path_t &rhs){
-    if(lhs.closed || rhs.closed || (lhs.points.size() < 2U) || (rhs.points.size() < 2U)){
-        return false;
-    }
-
-    if(points_coincident(lhs.points.back(), rhs.points.front())){
-        lhs.points.insert(std::end(lhs.points), std::next(std::begin(rhs.points)), std::end(rhs.points));
-    }else if(points_coincident(lhs.points.back(), rhs.points.back())){
-        std::reverse(std::begin(rhs.points), std::end(rhs.points));
-        lhs.points.insert(std::end(lhs.points), std::next(std::begin(rhs.points)), std::end(rhs.points));
-    }else if(points_coincident(lhs.points.front(), rhs.points.back())){
-        lhs.points.insert(std::begin(lhs.points), std::begin(rhs.points), std::prev(std::end(rhs.points)));
-    }else if(points_coincident(lhs.points.front(), rhs.points.front())){
-        std::reverse(std::begin(rhs.points), std::end(rhs.points));
-        lhs.points.insert(std::begin(lhs.points), std::begin(rhs.points), std::prev(std::end(rhs.points)));
-    }else{
-        return false;
-    }
-
-    lhs.points = deduplicate_polyline_points(lhs.points, &lhs.closed);
-    rhs.points.clear();
-    rhs.closed = false;
-    return true;
-}
-
-static std::size_t compute_discretization_segments(const Sketch &sketch,
-                                                   Sketch::primitive_index_t idx,
-                                                   double max_error,
-                                                   std::size_t max_segments){
-    const auto *primitive = sketch.primitive(idx);
-    if(!primitive || max_error <= 0.0) return max_segments;
-
-    switch(primitive->kind()){
-        case Sketch::primitive_kind_t::vertex:
-        case Sketch::primitive_kind_t::line:
-            return 1U;
-        case Sketch::primitive_kind_t::circle: {
-            const auto *circle = dynamic_cast<const Sketch::circle_primitive_t*>(primitive);
-            if(!circle || circle->radius <= 0.0) return max_segments;
-            const auto n = static_cast<std::size_t>(std::ceil(2.0 * std::acos(-1.0) * std::sqrt(circle->radius / (8.0 * max_error))));
-            return std::clamp(n, static_cast<std::size_t>(16U), max_segments);
-        }
-        case Sketch::primitive_kind_t::arc: {
-            const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(primitive);
-            if(!arc || arc->radius <= 0.0) return max_segments;
-            auto sweep = arc->stop_angle - arc->start_angle;
-            if(sweep <= 0.0) sweep += 2.0 * std::acos(-1.0);
-            const auto n = static_cast<std::size_t>(std::ceil(sweep * std::sqrt(arc->radius / (8.0 * max_error))));
-            return std::clamp(n, static_cast<std::size_t>(16U), max_segments);
-        }
-        case Sketch::primitive_kind_t::bezier: {
-            const auto samples = sketch.sample_primitive(idx, 48U);
-            if(samples.size() < 2U) return max_segments;
-            double max_dist_sq = 0.0;
-            const auto &first = samples.front();
-            for(const auto &p : samples){
-                max_dist_sq = std::max(max_dist_sq, first.sq_dist(p));
-            }
-            const auto effective_radius = std::max(std::sqrt(max_dist_sq) * 0.5, max_error);
-            const auto n = static_cast<std::size_t>(std::ceil(std::acos(-1.0) * std::sqrt(effective_radius / (8.0 * max_error))));
-            return std::clamp(n, static_cast<std::size_t>(24U), max_segments);
-        }
-    }
-    return max_segments;
-}
-
-static std::vector<extruded_path_t> collect_extruded_paths(const Sketch &sketch,
-                                                           std::size_t curve_segments){
-    std::vector<extruded_path_t> paths;
-    for(std::size_t primitive_idx = 0U; primitive_idx < sketch.primitive_count(); ++primitive_idx){
-        const auto *primitive_ptr = sketch.primitive(primitive_idx);
-        if(primitive_ptr == nullptr) continue;
-        if(primitive_ptr->kind() == Sketch::primitive_kind_t::vertex) continue;
-
-        const auto sampled_points = sketch.sample_primitive(primitive_idx, curve_segments);
-        if(sampled_points.size() < 2U) continue;
-
-        bool closed = (primitive_ptr->kind() == Sketch::primitive_kind_t::circle);
-        auto points = deduplicate_polyline_points(sampled_points, &closed);
-        if(points.size() < 2U) continue;
-        if(closed && (points.size() < 3U)) continue;
-        paths.push_back(extruded_path_t{ std::move(points), closed });
-    }
-
-    bool merged_any = true;
-    while(merged_any){
-        merged_any = false;
-        for(std::size_t i = 0U; i < paths.size(); ++i){
-            if(paths.at(i).closed || paths.at(i).points.empty()) continue;
-            for(std::size_t j = i + 1U; j < paths.size(); ++j){
-                if(paths.at(j).closed || paths.at(j).points.empty()) continue;
-                if(merge_extruded_paths(paths.at(i), paths.at(j))){
-                    merged_any = true;
-                    break;
-                }
-            }
-            if(merged_any) break;
-        }
-    }
-
-    paths.erase(std::remove_if(std::begin(paths), std::end(paths), [](const auto &path){
-        return path.points.size() < 2U;
-    }), std::end(paths));
-    return paths;
-}
-
-static void append_extruded_polyline_sides(const Sketch &sketch,
-                                           const extruded_path_t &path,
-                                           const Sketch::projection_t &scale_centre,
-                                           double near_offset,
-                                           double far_offset,
-                                           double near_scale,
-                                           double far_scale,
-                                           fv_surface_mesh<double, uint64_t> &mesh){
-    if(path.points.size() < 2U) return;
-    if(path.closed && (path.points.size() < 3U)) return;
-
-    const auto normal = sketch.plane().normal();
-    const auto projected_points = project_polyline(sketch, path.points);
-    const uint64_t base_vertex = static_cast<uint64_t>(mesh.vertices.size());
-    for(const auto &projected_point : projected_points){
-        const auto near_point = sketch.lift(scale_projection_about(projected_point, scale_centre, near_scale));
-        const auto far_point = sketch.lift(scale_projection_about(projected_point, scale_centre, far_scale));
-        mesh.vertices.emplace_back(near_point + normal * near_offset);
-        mesh.vertices.emplace_back(far_point + normal * far_offset);
-    }
-
-    bool closed_ccw = true;
-    if(path.closed){
-        closed_ccw = (signed_polygon_area(projected_points) >= 0.0);
-    }
-
-    const auto emit_side_faces = [&](uint64_t i, uint64_t j) -> void {
-        const auto near_i = base_vertex + (i * 2U);
-        const auto far_i = near_i + 1U;
-        const auto near_j = base_vertex + (j * 2U);
-        const auto far_j = near_j + 1U;
-        if(!path.closed || closed_ccw){
-            append_triangle(mesh, near_i, near_j, far_j);
-            append_triangle(mesh, near_i, far_j, far_i);
-        }else{
-            append_triangle(mesh, near_i, far_j, near_j);
-            append_triangle(mesh, near_i, far_i, far_j);
-        }
-    };
-
-    for(uint64_t i = 0U; (i + 1U) < static_cast<uint64_t>(path.points.size()); ++i){
-        emit_side_faces(i, i + 1U);
-    }
-    if(path.closed){
-        emit_side_faces(static_cast<uint64_t>(path.points.size() - 1U), 0U);
-    }
-}
-
-static void append_extruded_end_caps(const Sketch &sketch,
-                                     const std::vector<extruded_path_t> &paths,
-                                     const Sketch::projection_t &scale_centre,
-                                     double near_offset,
-                                     double far_offset,
-                                     double near_scale,
-                                     double far_scale,
-                                     fv_surface_mesh<double, uint64_t> &mesh,
-                                     std::vector<fv_surface_mesh<double, uint64_t>> *cap_meshes){
-    std::vector<std::vector<Sketch::projection_t>> closed_loops;
-    std::vector<vec3<double>> cap_vertices_2d;
-    for(const auto &path : paths){
-        if(!path.closed || (path.points.size() < 3U)) continue;
-        auto projected_loop = project_polyline(sketch, path.points);
-        if(projected_loop.size() < 3U) continue;
-        closed_loops.push_back(projected_loop);
-        for(const auto &point : projected_loop){
-            cap_vertices_2d.emplace_back(point.u, point.v, 0.0);
-        }
-    }
-    if(closed_loops.empty() || (cap_vertices_2d.size() < 3U)) return;
-
-    const auto planar_caps = Delaunay_Triangulation_2<double, uint64_t>(cap_vertices_2d);
-    if(planar_caps.faces.empty()) return;
-
-    const auto normal = sketch.plane().normal();
-    fv_surface_mesh<double, uint64_t> near_cap_mesh;
-    fv_surface_mesh<double, uint64_t> far_cap_mesh;
-    const uint64_t near_base = static_cast<uint64_t>(mesh.vertices.size());
-    for(const auto &point : cap_vertices_2d){
-        const Sketch::projection_t projected_point{ point.x, point.y };
-        const auto scaled_near = sketch.lift(scale_projection_about(projected_point, scale_centre, near_scale));
-        mesh.vertices.emplace_back(scaled_near + normal * near_offset);
-        near_cap_mesh.vertices.emplace_back(scaled_near + normal * near_offset);
-    }
-    const uint64_t far_base = static_cast<uint64_t>(mesh.vertices.size());
-    for(const auto &point : cap_vertices_2d){
-        const Sketch::projection_t projected_point{ point.x, point.y };
-        const auto scaled_far = sketch.lift(scale_projection_about(projected_point, scale_centre, far_scale));
-        mesh.vertices.emplace_back(scaled_far + normal * far_offset);
-        far_cap_mesh.vertices.emplace_back(scaled_far + normal * far_offset);
-    }
-
-    struct cap_face_candidate_t {
-        uint64_t i0;
-        uint64_t i1;
-        uint64_t i2;
-        double area2;
-    };
-    std::vector<cap_face_candidate_t> cap_candidates;
-    for(const auto &face : planar_caps.faces){
-        if(face.size() != 3U) continue;
-        const auto &a = cap_vertices_2d.at(face.at(0));
-        const auto &b = cap_vertices_2d.at(face.at(1));
-        const auto &c = cap_vertices_2d.at(face.at(2));
-        const Sketch::projection_t centroid = {
-            (a.x + b.x + c.x) / 3.0,
-            (a.y + b.y + c.y) / 3.0
-        };
-        if(!point_in_filled_loops(centroid, closed_loops)) continue;
-
-        const Sketch::projection_t pa{ a.x, a.y };
-        const Sketch::projection_t pb{ b.x, b.y };
-        const Sketch::projection_t pc{ c.x, c.y };
-
-        const auto area2 = signed_triangle_area2(pa, pb, pc);
-        if(std::abs(area2) <= solver_min_epsilon) continue;
-
-        const auto i0 = static_cast<uint64_t>(face.at(0));
-        const auto i1 = static_cast<uint64_t>(face.at(1));
-        const auto i2 = static_cast<uint64_t>(face.at(2));
-        cap_candidates.push_back(cap_face_candidate_t{ i0, i1, i2, area2 });
-    }
-
-    if(cap_candidates.empty()) return;
-
-    int64_t pos_count = 0;
-    int64_t neg_count = 0;
-    for(const auto &cand : cap_candidates){
-        if(cand.area2 > 0.0) ++pos_count;
-        else ++neg_count;
-    }
-
-    if(pos_count >= neg_count){
-        for(const auto &cand : cap_candidates){
-            const auto i0 = cand.i0;
-            const auto i1 = cand.i1;
-            const auto i2 = cand.i2;
-            if(cand.area2 > 0.0){
-                append_triangle(mesh, far_base + i0, far_base + i1, far_base + i2);
-                append_triangle(mesh, near_base + i0, near_base + i2, near_base + i1);
-                append_triangle(far_cap_mesh, i0, i1, i2);
-                append_triangle(near_cap_mesh, i0, i2, i1);
-            }else{
-                append_triangle(mesh, far_base + i0, far_base + i2, far_base + i1);
-                append_triangle(mesh, near_base + i0, near_base + i1, near_base + i2);
-                append_triangle(far_cap_mesh, i0, i2, i1);
-                append_triangle(near_cap_mesh, i0, i1, i2);
-            }
-        }
-    }else{
-        for(const auto &cand : cap_candidates){
-            const auto i0 = cand.i0;
-            const auto i1 = cand.i1;
-            const auto i2 = cand.i2;
-            if(cand.area2 < 0.0){
-                append_triangle(mesh, far_base + i0, far_base + i2, far_base + i1);
-                append_triangle(mesh, near_base + i0, near_base + i1, near_base + i2);
-                append_triangle(far_cap_mesh, i0, i2, i1);
-                append_triangle(near_cap_mesh, i0, i1, i2);
-            }else{
-                append_triangle(mesh, far_base + i0, far_base + i1, far_base + i2);
-                append_triangle(mesh, near_base + i0, near_base + i2, near_base + i1);
-                append_triangle(far_cap_mesh, i0, i1, i2);
-                append_triangle(near_cap_mesh, i0, i2, i1);
-            }
-        }
-    }
-    if(cap_meshes != nullptr){
-        cap_meshes->clear();
-        if(!near_cap_mesh.faces.empty()){
-            near_cap_mesh.recreate_involved_face_index();
-            cap_meshes->push_back(std::move(near_cap_mesh));
-        }
-        if(!far_cap_mesh.faces.empty()){
-            far_cap_mesh.recreate_involved_face_index();
-            cap_meshes->push_back(std::move(far_cap_mesh));
-        }
-    }
-}
-
-// Treat segments shorter than the solver epsilon as ill-defined so directional
-// constraints can report them as unresolved instead of silently satisfying a
-// zero determinant/dot-product identity.
-static bool projected_segment_is_degenerate(const Sketch::projection_t &a,
-                                            const Sketch::projection_t &b){
-    return projected_distance(a, b) <= solver_min_epsilon;
-}
-
-struct sketch_solver_context_t {
-    const Sketch &sketch;
-    const Sketch::solve_options_t &options;
-    std::vector<Sketch::projection_t> initial_vertices;
-    std::vector<tangent_descriptor_t> tangent_descriptors;
-
-    explicit sketch_solver_context_t(const Sketch &sketch_in,
-                                     const Sketch::solve_options_t &options_in)
-        : sketch(sketch_in),
-          options(options_in) {
-        initial_vertices.reserve(sketch.vertex_count());
-        for(std::size_t i = 0U; i < sketch.vertex_count(); ++i){
-            initial_vertices.push_back(sketch.project(sketch.vertex(i)));
-        }
-
-        tangent_descriptors.resize(sketch.constraint_count());
-        for(std::size_t i = 0U; i < sketch.constraint_count(); ++i){
-            const auto *tangent = dynamic_cast<const Sketch::tangent_constraint_t*>(sketch.constraint(i));
-            if(tangent == nullptr) continue;
-
-            const auto line_a = get_line_binding(sketch, tangent->primitive_a);
-            const auto line_b = get_line_binding(sketch, tangent->primitive_b);
-            const auto round_a = get_round_binding(sketch, tangent->primitive_a);
-            const auto round_b = get_round_binding(sketch, tangent->primitive_b);
-
-            auto &descriptor = tangent_descriptors.at(i);
-            if(line_a && round_b){
-                descriptor.mode = tangent_descriptor_t::mode_t::line_round;
-            }else if(round_a && line_b){
-                descriptor.mode = tangent_descriptor_t::mode_t::line_round;
-            }else if(round_a && round_b){
-                const auto centre_a = initial_vertices.at(round_a->center);
-                const auto centre_b = initial_vertices.at(round_b->center);
-                const auto radius_a = projected_distance(centre_a, initial_vertices.at(round_a->radius_point));
-                const auto radius_b = projected_distance(centre_b, initial_vertices.at(round_b->radius_point));
-                const auto centre_distance = projected_distance(centre_a, centre_b);
-                const auto external_error = std::abs(centre_distance - (radius_a + radius_b));
-                const auto internal_error = std::abs(centre_distance - std::abs(radius_a - radius_b));
-                if(internal_error < external_error){
-                    descriptor.mode = tangent_descriptor_t::mode_t::round_round_internal;
-                    descriptor.internal_sign = ((radius_a - radius_b) >= 0.0) ? 1.0 : -1.0;
-                }else{
-                    descriptor.mode = tangent_descriptor_t::mode_t::round_round_external;
-                }
-            }
-        }
-    }
-
-    std::size_t state_size() const{
-        return initial_vertices.size() * 2U;
-    }
-
-    std::vector<double> initial_state() const{
-        std::vector<double> out;
-        out.reserve(state_size());
-        for(const auto &projected_vertex : initial_vertices){
-            out.push_back(projected_vertex.u);
-            out.push_back(projected_vertex.v);
-        }
-        return out;
-    }
-
-    Sketch::projection_t projected_vertex(const std::vector<double> &state,
-                                          Sketch::vertex_index_t vertex_idx) const{
-        const auto base = vertex_idx * 2U;
-        return { state.at(base), state.at(base + 1U) };
-    }
-
-    double round_radius(const std::vector<double> &state,
-                        const round_binding_t &round) const{
-        return projected_distance(projected_vertex(state, round.center),
-                                  projected_vertex(state, round.radius_point));
-    }
-
-    std::vector<double> residual_vector(const std::vector<double> &state,
-                                        std::vector<residual_block_t> *blocks = nullptr,
-                                        std::size_t *enabled_constraints = nullptr) const{
-        std::vector<double> residuals;
-        residuals.reserve((sketch.constraint_count() * 2U) + state.size());
-        if(blocks != nullptr) blocks->clear();
-        if(enabled_constraints != nullptr) *enabled_constraints = 0U;
-
-        for(std::size_t constraint_idx = 0U; constraint_idx < sketch.constraint_count(); ++constraint_idx){
-            const auto *constraint_ptr = sketch.constraint(constraint_idx);
-            if((constraint_ptr == nullptr) || !constraint_ptr->enabled) continue;
-            if(enabled_constraints != nullptr) ++(*enabled_constraints);
-
-            if(const auto *horizontal = dynamic_cast<const Sketch::horizontal_constraint_t*>(constraint_ptr); horizontal != nullptr){
-                const auto line = get_line_binding(sketch, horizontal->line);
-                if(!line){
-                    // Use a unit penalty to keep the residual clearly non-zero and
-                    // therefore unresolved, without dominating the rest of the system.
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-                    continue;
-                }
-                const auto a = projected_vertex(state, line->a);
-                const auto b = projected_vertex(state, line->b);
-                append_residual_block(residuals, blocks, constraint_idx, { b.v - a.v });
-
-            }else if(const auto *vertical = dynamic_cast<const Sketch::vertical_constraint_t*>(constraint_ptr); vertical != nullptr){
-                const auto line = get_line_binding(sketch, vertical->line);
-                if(!line){
-                    // Use a unit penalty to keep the residual clearly non-zero and
-                    // therefore unresolved, without dominating the rest of the system.
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-                    continue;
-                }
-                const auto a = projected_vertex(state, line->a);
-                const auto b = projected_vertex(state, line->b);
-                append_residual_block(residuals, blocks, constraint_idx, { b.u - a.u });
-
-            }else if(const auto *distance = dynamic_cast<const Sketch::distance_constraint_t*>(constraint_ptr); distance != nullptr){
-                if(const auto line = get_line_binding(sketch, distance->primitive); line){
-                    const auto a = projected_vertex(state, line->a);
-                    const auto b = projected_vertex(state, line->b);
-                    const auto du = b.u - a.u;
-                    const auto dv = b.v - a.v;
-                    append_residual_block(residuals, blocks, constraint_idx, {
-                        (du * du) + (dv * dv) - (distance->target_distance * distance->target_distance)
-                    });
-                }else if(const auto round = get_round_binding(sketch, distance->primitive); round){
-                    const auto centre = projected_vertex(state, round->center);
-                    const auto radius_point = projected_vertex(state, round->radius_point);
-                    const auto du = radius_point.u - centre.u;
-                    const auto dv = radius_point.v - centre.v;
-                    append_residual_block(residuals, blocks, constraint_idx, {
-                        (du * du) + (dv * dv) - (distance->target_distance * distance->target_distance)
-                    });
-                }else{
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-                    continue;
-                }
-
-            }else if(const auto *parallel = dynamic_cast<const Sketch::parallel_constraint_t*>(constraint_ptr); parallel != nullptr){
-                const auto line_a = get_line_binding(sketch, parallel->line_a);
-                const auto line_b = get_line_binding(sketch, parallel->line_b);
-                if(!line_a || !line_b){
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-                    continue;
-                }
-                const auto a0 = projected_vertex(state, line_a->a);
-                const auto a1 = projected_vertex(state, line_a->b);
-                const auto b0 = projected_vertex(state, line_b->a);
-                const auto b1 = projected_vertex(state, line_b->b);
-                if(projected_segment_is_degenerate(a0, a1) || projected_segment_is_degenerate(b0, b1)){
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-                    continue;
-                }
-                append_residual_block(residuals, blocks, constraint_idx, {
-                    ((a1.u - a0.u) * (b1.v - b0.v)) - ((a1.v - a0.v) * (b1.u - b0.u))
-                });
-
-            }else if(const auto *perpendicular = dynamic_cast<const Sketch::perpendicular_constraint_t*>(constraint_ptr); perpendicular != nullptr){
-                const auto line_a = get_line_binding(sketch, perpendicular->line_a);
-                const auto line_b = get_line_binding(sketch, perpendicular->line_b);
-                if(!line_a || !line_b){
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-                    continue;
-                }
-                const auto a0 = projected_vertex(state, line_a->a);
-                const auto a1 = projected_vertex(state, line_a->b);
-                const auto b0 = projected_vertex(state, line_b->a);
-                const auto b1 = projected_vertex(state, line_b->b);
-                if(projected_segment_is_degenerate(a0, a1) || projected_segment_is_degenerate(b0, b1)){
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-                    continue;
-                }
-                append_residual_block(residuals, blocks, constraint_idx, {
-                    ((a1.u - a0.u) * (b1.u - b0.u)) + ((a1.v - a0.v) * (b1.v - b0.v))
-                });
-
-            }else if(const auto *pin = dynamic_cast<const Sketch::pin_constraint_t*>(constraint_ptr); pin != nullptr){
-                if(pin->vertex >= initial_vertices.size()){
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0, 1.0 });
-                    continue;
-                }
-                const auto projected = projected_vertex(state, pin->vertex);
-                const auto target = sketch.project(pin->pinned_position);
-                append_residual_block(residuals, blocks, constraint_idx, {
-                    projected.u - target.u,
-                    projected.v - target.v
-                });
-
-            }else if(const auto *tangent = dynamic_cast<const Sketch::tangent_constraint_t*>(constraint_ptr); tangent != nullptr){
-                const auto descriptor = tangent_descriptors.at(constraint_idx);
-                const auto line_a = get_line_binding(sketch, tangent->primitive_a);
-                const auto line_b = get_line_binding(sketch, tangent->primitive_b);
-                const auto round_a = get_round_binding(sketch, tangent->primitive_a);
-                const auto round_b = get_round_binding(sketch, tangent->primitive_b);
-
-                if(descriptor.mode == tangent_descriptor_t::mode_t::line_round){
-                    const auto line = line_a ? line_a : line_b;
-                    const auto round = round_a ? round_a : round_b;
-                    if(!line || !round){
-                        append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-                        continue;
-                    }
-                    const auto p0 = projected_vertex(state, line->a);
-                    const auto p1 = projected_vertex(state, line->b);
-                    const auto centre = projected_vertex(state, round->center);
-                    const auto radius = round_radius(state, *round);
-                    // Use a smooth squared residual instead of abs() to avoid the
-                    // non-differentiable kink at zero, which helps the LM solver converge.
-                    const auto sd = signed_distance_to_line(centre, p0, p1);
-                    append_residual_block(residuals, blocks, constraint_idx, {
-                        (sd * sd) - (radius * radius)
-                    });
-                }else if(descriptor.mode == tangent_descriptor_t::mode_t::round_round_external
-                      || descriptor.mode == tangent_descriptor_t::mode_t::round_round_internal){
-                    if(!round_a || !round_b){
-                        append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-                        continue;
-                    }
-                    const auto centre_a = projected_vertex(state, round_a->center);
-                    const auto centre_b = projected_vertex(state, round_b->center);
-                    const auto radius_a = round_radius(state, *round_a);
-                    const auto radius_b = round_radius(state, *round_b);
-                    const auto centre_distance = projected_distance(centre_a, centre_b);
-                    if(descriptor.mode == tangent_descriptor_t::mode_t::round_round_external){
-                        append_residual_block(residuals, blocks, constraint_idx, {
-                            centre_distance - (radius_a + radius_b)
-                        });
-                    }else{
-                        append_residual_block(residuals, blocks, constraint_idx, {
-                            centre_distance - (descriptor.internal_sign * (radius_a - radius_b))
-                        });
-                    }
-                }else{
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-                }
-
-            }else if(const auto *mirror = dynamic_cast<const Sketch::mirror_constraint_t*>(constraint_ptr); mirror != nullptr){
-                const auto line = get_line_binding(sketch, mirror->line);
-                if(!line || (mirror->vertex_a >= initial_vertices.size()) || (mirror->vertex_b >= initial_vertices.size())){
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0, 1.0 });
-                    continue;
-                }
-                const auto line_a = projected_vertex(state, line->a);
-                const auto line_b = projected_vertex(state, line->b);
-                const auto reflected = reflect_across_line(projected_vertex(state, mirror->vertex_a), line_a, line_b);
-                const auto vertex_b = projected_vertex(state, mirror->vertex_b);
-                append_residual_block(residuals, blocks, constraint_idx, {
-                    vertex_b.u - reflected.u,
-                    vertex_b.v - reflected.v
-                });
-
-            }else if(const auto *overlap = dynamic_cast<const Sketch::overlap_constraint_t*>(constraint_ptr); overlap != nullptr){
-                if((overlap->vertex_a >= initial_vertices.size()) || (overlap->vertex_b >= initial_vertices.size())){
-                    append_residual_block(residuals, blocks, constraint_idx, { 1.0, 1.0 });
-                    continue;
-                }
-                const auto a = projected_vertex(state, overlap->vertex_a);
-                const auto b = projected_vertex(state, overlap->vertex_b);
-                append_residual_block(residuals, blocks, constraint_idx, {
-                    b.u - a.u,
-                    b.v - a.v
-                });
-
-            }else{
-                append_residual_block(residuals, blocks, constraint_idx, { 1.0 });
-            }
-        }
-
-        if(options.constrain_to_bounds && options.bounds && options.bounds->is_valid()){
-            for(std::size_t i = 0U; i < initial_vertices.size(); ++i){
-                const auto projected = projected_vertex(state, i);
-                const auto min_u_violation = std::max(options.bounds->min.u - projected.u, 0.0);
-                const auto max_u_violation = std::max(projected.u - options.bounds->max.u, 0.0);
-                const auto min_v_violation = std::max(options.bounds->min.v - projected.v, 0.0);
-                const auto max_v_violation = std::max(projected.v - options.bounds->max.v, 0.0);
-                append_residual_block(residuals, blocks, sketch.constraint_count() + i, {
-                    min_u_violation,
-                    max_u_violation,
-                    min_v_violation,
-                    max_v_violation
-                }, true);
-            }
-        }
-
-        if(options.enable_sticky_constraints && (options.sticky_weight > 0.0)){
-            for(std::size_t i = 0U; i < initial_vertices.size(); ++i){
-                const auto projected = projected_vertex(state, i);
-                const auto anchor = initial_vertices.at(i);
-                append_residual_block(residuals, blocks, i, {
-                    options.sticky_weight * (projected.u - anchor.u),
-                    options.sticky_weight * (projected.v - anchor.v)
-                }, true);
-            }
-        }
-
-        return residuals;
-    }
-
-#ifdef DCMA_USE_EIGEN
-    struct jacobian_bundle_t {
-        Eigen::SparseMatrix<double> sparse;
-        Eigen::MatrixXd dense;
-    };
-
-    jacobian_bundle_t jacobian(const std::vector<double> &state) const{
-        std::vector<residual_block_t> blocks;
-        const auto base_residuals = residual_vector(state, &blocks, nullptr);
-        jacobian_bundle_t out;
-        out.dense = Eigen::MatrixXd::Zero(static_cast<Eigen::Index>(base_residuals.size()),
-                                          static_cast<Eigen::Index>(state.size()));
-        std::vector<Eigen::Triplet<double>> triplets;
-        const auto step = std::max(options.finite_difference_step, solver_min_epsilon);
-
-        for(std::size_t col = 0U; col < state.size(); ++col){
-            auto plus = state;
-            auto minus = state;
-            plus.at(col) += step;
-            minus.at(col) -= step;
-            const auto residuals_plus = residual_vector(plus, nullptr, nullptr);
-            const auto residuals_minus = residual_vector(minus, nullptr, nullptr);
-            for(std::size_t row = 0U; row < base_residuals.size(); ++row){
-                const auto derivative = (residuals_plus.at(row) - residuals_minus.at(row)) / (2.0 * step);
-                if(std::abs(derivative) > jacobian_sparsity_threshold){
-                    out.dense(static_cast<Eigen::Index>(row), static_cast<Eigen::Index>(col)) = derivative;
-                    triplets.emplace_back(static_cast<Eigen::Index>(row),
-                                          static_cast<Eigen::Index>(col),
-                                          derivative);
-                }
-            }
-        }
-
-        out.sparse.resize(static_cast<Eigen::Index>(base_residuals.size()),
-                          static_cast<Eigen::Index>(state.size()));
-        out.sparse.setFromTriplets(std::begin(triplets), std::end(triplets));
-        return out;
-    }
-#endif // DCMA_USE_EIGEN
-};
 
 }
 
@@ -1849,8 +767,6 @@ Sketch::refresh_primitive_geometry(primitive_index_t idx,
                 return false;
             }
 
-            // The start vertex defines the canonical arc radius during interactive editing; the stop vertex contributes
-            // the terminal angle unless the start point collapses onto the centre.
             arc->radius = (start_radius <= std::numeric_limits<double>::epsilon()) ? stop_radius : start_radius;
             arc->start_angle = normalize_angle((start_radius <= std::numeric_limits<double>::epsilon())
                                                ? 0.0
@@ -1860,8 +776,6 @@ Sketch::refresh_primitive_geometry(primitive_index_t idx,
                                               : std::atan2(stop_dv, stop_du));
 
             if(arc->radius > std::numeric_limits<double>::epsilon()){
-                // Arc endpoints are constrained to the shared radius so that editing the stored vertices keeps the
-                // rendered arc and draggable endpoints synchronized.
                 if(start_on_plane && (pinned_vertices.count(arc->start) == 0U)){
                     const auto snapped_start = point_on_circle(plane(), centre, arc->radius, arc->start_angle);
                     if(vertices_.at(arc->start).distance(snapped_start) > on_plane_tolerance){
@@ -1932,8 +846,6 @@ Sketch::sample_primitive(primitive_index_t idx, std::size_t segments) const{
     const auto *base = primitives_.at(idx).get();
     if(base == nullptr) return {};
     if(!has_plane_){
-        // Curved planar primitives cache or derive their geometry in plane coordinates, while vertices and lines can be
-        // sampled directly from stored world-space points.
         switch(base->kind()){
             case primitive_kind_t::circle:
             case primitive_kind_t::arc:
@@ -2185,11 +1097,13 @@ Sketch::clamp_vertices_to_bounds(const bounding_box_t &bounds){
     if(!has_plane_ || !bounds.is_valid()) return false;
 
     bool changed = false;
+    constexpr double min_epsilon = 1.0E-9;
+
     for(auto &point : vertices_){
         const auto projected = project(point);
         const auto clamped = clamp_to_bounds(projected, bounds);
-        if((std::abs(projected.u - clamped.u) > solver_min_epsilon)
-        || (std::abs(projected.v - clamped.v) > solver_min_epsilon)){
+        if((std::abs(projected.u - clamped.u) > min_epsilon)
+        || (std::abs(projected.v - clamped.v) > min_epsilon)){
             point = lift(clamped);
             changed = true;
         }
@@ -2208,7 +1122,21 @@ Sketch::summarize_degrees_of_freedom() const{
         if(constraint_ptr == nullptr) continue;
         if(constraint_ptr->enabled){
             ++out.enabled_constraints;
-            out.constrained += constraint_dof_contribution(*constraint_ptr);
+            switch(constraint_ptr->kind()){
+                case constraint_kind_t::horizontal:
+                case constraint_kind_t::vertical:
+                case constraint_kind_t::distance:
+                case constraint_kind_t::parallel:
+                case constraint_kind_t::perpendicular:
+                case constraint_kind_t::tangent:
+                    out.constrained += 1U;
+                    break;
+                case constraint_kind_t::pin:
+                case constraint_kind_t::mirror:
+                case constraint_kind_t::overlap:
+                    out.constrained += 2U;
+                    break;
+            }
         }else{
             ++out.disabled_constraints;
         }
@@ -2480,8 +1408,6 @@ Sketch::add_distance_constraint(primitive_index_t primitive_idx, double target_d
         }else if(const auto *arc = dynamic_cast<const arc_primitive_t*>(primitive(primitive_idx)); arc != nullptr){
             const auto start_radius = vertex(arc->center).distance(vertex(arc->start));
             const auto stop_radius = vertex(arc->center).distance(vertex(arc->stop));
-            // Arcs can drift slightly out of round before the constraint is added, so seed the
-            // requested radius from the mean of both endpoints instead of privileging one side.
             constraint->target_distance = 0.5 * (start_radius + stop_radius);
         }else{
             throw std::invalid_argument("Distance constraints currently require a line, circle, or arc primitive");
@@ -2686,137 +1612,7 @@ Sketch::add_fillet(primitive_index_t line_a_idx,
                    primitive_index_t line_b_idx,
                    double radius,
                    std::string *error_message){
-    if(!primitive_index_valid(line_a_idx) || !primitive_index_valid(line_b_idx)){
-        store_error(error_message, "Fillet requires valid primitive indices");
-        return false;
-    }
-
-    const auto *line_a = dynamic_cast<const line_primitive_t*>(primitive(line_a_idx));
-    const auto *line_b = dynamic_cast<const line_primitive_t*>(primitive(line_b_idx));
-    if(!line_a || !line_b){
-        store_error(error_message, "Fillet requires two line primitives");
-        return false;
-    }
-
-    if(!std::isfinite(radius) || (radius <= solver_min_epsilon)){
-        store_error(error_message, "Fillet radius must be finite and positive");
-        return false;
-    }
-
-    vertex_index_t shared_vertex = 0U;
-    vertex_index_t a_other = 0U;
-    vertex_index_t b_other = 0U;
-    bool found = false;
-    for(const auto va : line_a->vertices){
-        for(const auto vb : line_b->vertices){
-            if(va == vb){
-                shared_vertex = va;
-                a_other = (va == line_a->vertices[0]) ? line_a->vertices[1] : line_a->vertices[0];
-                b_other = (vb == line_b->vertices[0]) ? line_b->vertices[1] : line_b->vertices[0];
-                found = true;
-                break;
-            }
-        }
-        if(found) break;
-    }
-    if(!found){
-        store_error(error_message, "Fillet requires two lines sharing a common vertex");
-        return false;
-    }
-
-    const auto shared_pos = vertex(shared_vertex);
-    const auto a_pos = vertex(a_other);
-    const auto b_pos = vertex(b_other);
-
-    const auto v1 = a_pos - shared_pos;
-    const auto v2 = b_pos - shared_pos;
-    const auto len1 = v1.length();
-    const auto len2 = v2.length();
-
-    if((len1 < solver_min_epsilon) || (len2 < solver_min_epsilon)){
-        store_error(error_message, "Line segments too short for filleting");
-        return false;
-    }
-
-    const auto cos_angle = std::clamp(v1.Dot(v2) / (len1 * len2), -1.0, 1.0);
-    const auto angle = std::acos(cos_angle);
-
-    if((std::abs(angle) < solver_min_epsilon) || (std::abs(std::acos(-1.0) - angle) < solver_min_epsilon)){
-        store_error(error_message, "Lines are (nearly) collinear; cannot fillet");
-        return false;
-    }
-
-    const auto half_angle = angle * 0.5;
-    const auto sin_half = std::sin(half_angle);
-    const auto tan_half = std::tan(half_angle);
-    const auto tan_dist = radius / tan_half;
-    const auto centre_dist = radius / sin_half;
-
-    if((tan_dist >= len1) || (tan_dist >= len2)){
-        store_error(error_message, "Fillet radius too large for the line segments");
-        return false;
-    }
-
-    const auto u1 = v1 / len1;
-    const auto u2 = v2 / len2;
-
-    const auto bisector_raw = u1 + u2;
-    const auto bisector_len = bisector_raw.length();
-    if(bisector_len < solver_min_epsilon){
-        store_error(error_message, "Unable to compute angle bisector");
-        return false;
-    }
-    const auto bisector = bisector_raw / bisector_len;
-
-    const auto centre_pos = shared_pos + bisector * centre_dist;
-    const auto tan1_pos = shared_pos + u1 * tan_dist;
-    const auto tan2_pos = shared_pos + u2 * tan_dist;
-
-    const auto centre_vertex = append_vertex(centre_pos);
-    const auto tan1_vertex = append_vertex(tan1_pos);
-    const auto tan2_vertex = append_vertex(tan2_pos);
-
-    {
-        auto *la = dynamic_cast<line_primitive_t*>(primitives_.at(line_a_idx).get());
-        if(la){
-            for(auto &v : la->vertices){
-                if(v == shared_vertex) v = tan1_vertex;
-            }
-        }
-    }
-    {
-        auto *lb = dynamic_cast<line_primitive_t*>(primitives_.at(line_b_idx).get());
-        if(lb){
-            for(auto &v : lb->vertices){
-                if(v == shared_vertex) v = tan2_vertex;
-            }
-        }
-    }
-
-    add_arc(centre_vertex, tan1_vertex, tan2_vertex, geometry_tag_t::normal);
-    // Ensure the fillet arc takes the shorter (inside) path rather than wrapping
-    // around the outside (Omega-shaped). The two tangent points define two possible
-    // arcs on the circle; we want the arc whose sweep angle is <= pi.
-    {
-        const auto last_arc_idx = primitives_.size() - 1U;
-        auto *arc = dynamic_cast<arc_primitive_t*>(primitives_.at(last_arc_idx).get());
-        if(arc != nullptr){
-            const auto arc_start_p = project(vertex(arc->start));
-            const auto arc_stop_p = project(vertex(arc->stop));
-            const auto centre_p = project(centre_pos);
-            const auto start_angle = std::atan2(arc_start_p.v - centre_p.v, arc_start_p.u - centre_p.u);
-            const auto stop_angle = std::atan2(arc_stop_p.v - centre_p.v, arc_stop_p.u - centre_p.u);
-            double sweep = stop_angle - start_angle;
-            if(sweep <= 0.0) sweep += 2.0 * pi_constant;
-            // If the sweep exceeds pi, swapping the endpoints gives the shorter arc.
-            if(sweep > pi_constant){
-                std::swap(arc->start, arc->stop);
-            }
-        }
-    }
-    delete_unreferenced_vertices();
-    refresh_all_derived_geometry();
-    return true;
+    return sketch_fillets::add_fillet(*this, line_a_idx, line_b_idx, radius, error_message);
 }
 
 bool
@@ -2839,494 +1635,7 @@ Sketch::solve_constraints(std::size_t max_iterations){
 
 std::size_t
 Sketch::solve_constraints(const solve_options_t &options){
-    last_solve_report_ = {};
-
-    const bool solve_with_bounds = options.constrain_to_bounds && options.bounds && options.bounds->is_valid();
-    if(!has_plane_ || vertices_.empty() || (constraints_.empty() && !solve_with_bounds)){
-        return 0U;
-    }
-
-    sketch_solver_context_t context(*this, options);
-    auto initial_state = context.initial_state();
-    std::size_t enabled_constraints = 0U;
-    const auto initial_residuals = context.residual_vector(initial_state, nullptr, &enabled_constraints);
-    last_solve_report_.enabled_constraints = enabled_constraints;
-    last_solve_report_.residual_count = initial_residuals.size();
-
-    // Pre-position geometry for tangent constraints involving a line and a round primitive.
-    // Move the line endpoint nearest the round such that the line is locally perpendicular to
-    // the radius from the round centre, which guarantees the tangent constraint is satisfied.
-    // This provides a good initial guess for the LM solver and prevents the arc from shrinking
-    // or the solver from converging to a non-tangent arrangement.
-    if(has_plane_){
-        for(std::size_t constraint_idx = 0U; constraint_idx < constraints_.size(); ++constraint_idx){
-            const auto *tangent = dynamic_cast<const tangent_constraint_t*>(constraints_.at(constraint_idx).get());
-            if((tangent == nullptr) || !constraints_.at(constraint_idx)->enabled) continue;
-
-            const auto line_binding = get_line_binding(*this, tangent->primitive_a);
-            const auto round_binding = get_round_binding(*this, tangent->primitive_b);
-            const bool a_is_line = line_binding.has_value();
-            const bool b_is_line = get_line_binding(*this, tangent->primitive_b).has_value();
-            const bool a_is_round = round_binding.has_value();
-            const bool b_is_round = get_round_binding(*this, tangent->primitive_a).has_value();
-
-            std::optional<line_binding_t> line;
-            std::optional<round_binding_t> round;
-            if(a_is_line && b_is_round){
-                line = get_line_binding(*this, tangent->primitive_a);
-                round = get_round_binding(*this, tangent->primitive_b);
-            }else if(a_is_round && b_is_line){
-                line = get_line_binding(*this, tangent->primitive_b);
-                round = get_round_binding(*this, tangent->primitive_a);
-            }
-            if(!line || !round) continue;
-
-            const auto centre_proj = context.projected_vertex(initial_state, round->center);
-            const auto radius_point_proj = context.projected_vertex(initial_state, round->radius_point);
-            const auto radius = projected_distance(centre_proj, radius_point_proj);
-            if(radius <= solver_min_epsilon) continue;
-
-            const auto line_a_proj = context.projected_vertex(initial_state, line->a);
-            const auto line_b_proj = context.projected_vertex(initial_state, line->b);
-            const auto line_dir_u = line_b_proj.u - line_a_proj.u;
-            const auto line_dir_v = line_b_proj.v - line_a_proj.v;
-            const auto line_len = std::hypot(line_dir_u, line_dir_v);
-            if(line_len <= solver_min_epsilon) continue;
-
-            // The line's endpoint nearest the arc centre is the likely contact point.
-            const auto dist_a = projected_distance(line_a_proj, centre_proj);
-            const auto dist_b = projected_distance(line_b_proj, centre_proj);
-            const auto contact_vertex = (dist_a <= dist_b) ? line->a : line->b;
-            const auto other_vertex = (dist_a <= dist_b) ? line->b : line->a;
-
-            const auto contact_proj = context.projected_vertex(initial_state, contact_vertex);
-            const auto other_proj = context.projected_vertex(initial_state, other_vertex);
-            auto radial_u = contact_proj.u - centre_proj.u;
-            auto radial_v = contact_proj.v - centre_proj.v;
-            const auto radial_len = std::hypot(radial_u, radial_v);
-            if(radial_len <= solver_min_epsilon) continue;
-            radial_u /= radial_len;
-            radial_v /= radial_len;
-
-            // Tangent direction is perpendicular to the radius.
-            const auto tangent_u = -radial_v;
-            const auto tangent_v = radial_u;
-
-            // Project the far line endpoint onto the tangent direction to position the contact
-            // point on the tangent line at the correct radius distance from the centre.
-            const auto other_radial_u = other_proj.u - centre_proj.u;
-            const auto other_radial_v = other_proj.v - centre_proj.v;
-            const auto dot = (other_radial_u * tangent_u) + (other_radial_v * tangent_v);
-
-            const auto contact_u = centre_proj.u + radial_u * radius;
-            const auto contact_v = centre_proj.v + radial_v * radius;
-            const auto other_on_tangent_u = contact_u + tangent_u * dot;
-            const auto other_on_tangent_v = contact_v + tangent_v * dot;
-
-            const auto base_contact = contact_vertex * 2U;
-            const auto base_other = other_vertex * 2U;
-            initial_state.at(base_contact)     = contact_u;
-            initial_state.at(base_contact + 1U) = contact_v;
-            initial_state.at(base_other)     = other_on_tangent_u;
-            initial_state.at(base_other + 1U) = other_on_tangent_v;
-
-            // Also move the round primitive's vertex nearest the contact point to the
-            // tangent location. This prevents the round (e.g., arc) from shrinking
-            // during LM solving by anchoring its radius at the correct tangent point.
-            // The round's radius_point is its start vertex for arcs, or the radius_point
-            // for circles. Whichever round vertex is closest to the tangent point is
-            // repositioned there so the round already passes through the tangent point
-            // at the correct radius.
-            {
-                const auto rp_vert = round->radius_point;
-                // Determine which round endpoint is nearer the line contact point.
-                const auto rp_proj = context.projected_vertex(initial_state, rp_vert);
-                const auto dist_rp = projected_distance(rp_proj, { contact_u, contact_v });
-                // For arcs, also check the stop vertex distance.
-                std::optional<Sketch::vertex_index_t> stop_vert;
-                double dist_stop = std::numeric_limits<double>::max();
-                if(const auto *arc = dynamic_cast<const arc_primitive_t*>(
-                        primitive(tangent->primitive_a));
-                   arc != nullptr){
-                    stop_vert = arc->stop;
-                }else if(const auto *arc = dynamic_cast<const arc_primitive_t*>(
-                             primitive(tangent->primitive_b));
-                         arc != nullptr){
-                    stop_vert = arc->stop;
-                }
-                if(stop_vert && vertex_index_valid(*stop_vert)){
-                    // Ensure the stop vertex is also tracked in initial_state.
-                    const auto stop_proj = context.projected_vertex(initial_state, *stop_vert);
-                    dist_stop = projected_distance(stop_proj, { contact_u, contact_v });
-                }
-                // The round vertex we will move: the one nearest the tangent contact point.
-                auto round_vertex_to_move = rp_vert;
-                if(stop_vert && (dist_stop < dist_rp)){
-                    round_vertex_to_move = *stop_vert;
-                }
-                // Only move this vertex if it is not one of the line's vertices (which
-                // were already moved above), to avoid overwriting those positions.
-                if((round_vertex_to_move != contact_vertex) && (round_vertex_to_move != other_vertex)){
-                    const auto base_rv = round_vertex_to_move * 2U;
-                    initial_state.at(base_rv)     = contact_u;
-                    initial_state.at(base_rv + 1U) = contact_v;
-                }
-            }
-        }
-    }
-
-    lm_optimizer optimizer;
-    optimizer.initial_params = initial_state;
-    optimizer.max_iterations = static_cast<int64_t>(std::max<std::size_t>(options.max_iterations, 1U));
-    if(options.absolute_tolerance > 0.0){
-        optimizer.abs_tol = options.absolute_tolerance;
-    }
-    if(options.relative_tolerance > 0.0){
-        optimizer.rel_tol = options.relative_tolerance;
-    }
-    if(options.max_time_seconds > 0.0){
-        optimizer.max_time = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double>(options.max_time_seconds));
-    }
-    optimizer.fd_step = std::max(options.finite_difference_step, solver_min_epsilon);
-    optimizer.initial_lambda = std::max(options.initial_lambda, solver_min_epsilon);
-    optimizer.lambda_increase_factor = std::max(options.lambda_increase_factor, 1.000001);
-    optimizer.lambda_decrease_factor = std::clamp(options.lambda_decrease_factor, 1.0E-6, 0.999999);
-    optimizer.f = [&context](const std::vector<double> &state) -> double {
-        const auto residuals = context.residual_vector(state, nullptr, nullptr);
-        return std::inner_product(std::begin(residuals), std::end(residuals), std::begin(residuals), 0.0);
-    };
-
-    const auto result = optimizer.optimize();
-    last_solve_report_.iterations = result.iterations;
-    last_solve_report_.converged = result.converged;
-    last_solve_report_.reason = result.reason;
-    last_solve_report_.cost = result.cost;
-
-    for(std::size_t vertex_idx = 0U; vertex_idx < vertices_.size(); ++vertex_idx){
-        vertices_.at(vertex_idx) = lift(context.projected_vertex(result.params, vertex_idx));
-    }
-
-    bool has_tangent_constraints = false;
-    std::set<vertex_index_t> refinement_anchor_vertices;
-    for(const auto &constraint_ptr : constraints_){
-        if((constraint_ptr == nullptr) || !constraint_ptr->enabled){
-            continue;
-        }
-        if(const auto *horizontal = dynamic_cast<const horizontal_constraint_t*>(constraint_ptr.get()); horizontal != nullptr){
-            const auto *line = dynamic_cast<const line_primitive_t*>(primitive(horizontal->line));
-            if(line != nullptr) refinement_anchor_vertices.insert(line->vertices[0]);
-        }else if(const auto *vertical = dynamic_cast<const vertical_constraint_t*>(constraint_ptr.get()); vertical != nullptr){
-            const auto *line = dynamic_cast<const line_primitive_t*>(primitive(vertical->line));
-            if(line != nullptr) refinement_anchor_vertices.insert(line->vertices[0]);
-        }else if(const auto *distance = dynamic_cast<const distance_constraint_t*>(constraint_ptr.get()); distance != nullptr){
-            const auto *distance_primitive = primitive(distance->primitive);
-            const auto *line = dynamic_cast<const line_primitive_t*>(distance_primitive);
-            if(line != nullptr) refinement_anchor_vertices.insert(line->vertices[0]);
-            if(const auto *circle = dynamic_cast<const circle_primitive_t*>(distance_primitive); circle != nullptr){
-                refinement_anchor_vertices.insert(circle->center);
-            }
-            if(const auto *arc = dynamic_cast<const arc_primitive_t*>(distance_primitive); arc != nullptr){
-                refinement_anchor_vertices.insert(arc->center);
-            }
-        }else if(const auto *parallel = dynamic_cast<const parallel_constraint_t*>(constraint_ptr.get()); parallel != nullptr){
-            if(const auto *line = dynamic_cast<const line_primitive_t*>(primitive(parallel->line_a)); line != nullptr){
-                refinement_anchor_vertices.insert(line->vertices[0]);
-                refinement_anchor_vertices.insert(line->vertices[1]);
-            }
-        }else if(const auto *perpendicular = dynamic_cast<const perpendicular_constraint_t*>(constraint_ptr.get()); perpendicular != nullptr){
-            if(const auto *line = dynamic_cast<const line_primitive_t*>(primitive(perpendicular->line_a)); line != nullptr){
-                refinement_anchor_vertices.insert(line->vertices[0]);
-                refinement_anchor_vertices.insert(line->vertices[1]);
-            }
-        }else if(const auto *tangent = dynamic_cast<const tangent_constraint_t*>(constraint_ptr.get()); tangent != nullptr){
-            has_tangent_constraints = true;
-            if(const auto *primitive_ptr = primitive(tangent->primitive_a); primitive_ptr != nullptr){
-                const auto refs = primitive_ptr->referenced_vertices();
-                refinement_anchor_vertices.insert(std::begin(refs), std::end(refs));
-            }
-        }else if(const auto *mirror = dynamic_cast<const mirror_constraint_t*>(constraint_ptr.get()); mirror != nullptr){
-            if(const auto *line = dynamic_cast<const line_primitive_t*>(primitive(mirror->line)); line != nullptr){
-                refinement_anchor_vertices.insert(line->vertices[0]);
-                refinement_anchor_vertices.insert(line->vertices[1]);
-            }
-            refinement_anchor_vertices.insert(mirror->vertex_a);
-        }else if(const auto *overlap = dynamic_cast<const overlap_constraint_t*>(constraint_ptr.get()); overlap != nullptr){
-            refinement_anchor_vertices.insert(overlap->vertex_a);
-        }
-    }
-
-    // Tangency is solved by the LM pass itself; the linear post-pass can move
-    // vertices in ways that undo that nonlinear solution, so skip refinement
-    // entirely whenever tangent constraints are active.
-    if(!has_tangent_constraints && !constraints_.empty()){
-        const auto refinement_passes = std::min<std::size_t>(std::max<std::size_t>(options.max_iterations, 1U),
-                                                             max_refinement_passes);
-        for(std::size_t iter = 0U; iter < refinement_passes; ++iter){
-            for(const auto vertex_idx : refinement_anchor_vertices){
-                if(vertex_idx < context.initial_vertices.size()){
-                    vertices_.at(vertex_idx) = lift(context.initial_vertices.at(vertex_idx));
-                }
-            }
-            bool updated_vertices = false;
-            for(const auto &constraint_ptr : constraints_){
-                if((constraint_ptr == nullptr) || !constraint_ptr->enabled){
-                    continue;
-                }
-
-                if(const auto *horizontal = dynamic_cast<const horizontal_constraint_t*>(constraint_ptr.get()); horizontal != nullptr){
-                    const auto *line = dynamic_cast<const line_primitive_t*>(primitive(horizontal->line));
-                    if(line == nullptr) continue;
-                    auto a = project(vertex(line->vertices[0]));
-                    auto b = project(vertex(line->vertices[1]));
-                    b.v = a.v;
-                    vertices_.at(line->vertices[1]) = lift(b);
-                    updated_vertices = true;
-
-                }else if(const auto *vertical = dynamic_cast<const vertical_constraint_t*>(constraint_ptr.get()); vertical != nullptr){
-                    const auto *line = dynamic_cast<const line_primitive_t*>(primitive(vertical->line));
-                    if(line == nullptr) continue;
-                    auto a = project(vertex(line->vertices[0]));
-                    auto b = project(vertex(line->vertices[1]));
-                    b.u = a.u;
-                    vertices_.at(line->vertices[1]) = lift(b);
-                    updated_vertices = true;
-
-                }else if(const auto *distance = dynamic_cast<const distance_constraint_t*>(constraint_ptr.get()); distance != nullptr){
-                    if(const auto *line = dynamic_cast<const line_primitive_t*>(primitive(distance->primitive)); line != nullptr){
-                        const auto a = project(vertex(line->vertices[0]));
-                        auto b = project(vertex(line->vertices[1]));
-                        auto du = b.u - a.u;
-                        auto dv = b.v - a.v;
-                        const auto len = std::hypot(du, dv);
-                        if(len <= std::numeric_limits<double>::epsilon()){
-                            du = 1.0;
-                            dv = 0.0;
-                        }else{
-                            du /= len;
-                            dv /= len;
-                        }
-                        b.u = a.u + du * distance->target_distance;
-                        b.v = a.v + dv * distance->target_distance;
-                        vertices_.at(line->vertices[1]) = lift(b);
-                        updated_vertices = true;
-                    }else if(const auto *circle = dynamic_cast<const circle_primitive_t*>(primitive(distance->primitive)); circle != nullptr){
-                        const auto centre = project(vertex(circle->center));
-                        auto radius_point = project(vertex(circle->radius_point));
-                        auto du = radius_point.u - centre.u;
-                        auto dv = radius_point.v - centre.v;
-                        const auto len = std::hypot(du, dv);
-                        if(len <= std::numeric_limits<double>::epsilon()){
-                            du = 1.0;
-                            dv = 0.0;
-                        }else{
-                            du /= len;
-                            dv /= len;
-                        }
-                        radius_point.u = centre.u + du * distance->target_distance;
-                        radius_point.v = centre.v + dv * distance->target_distance;
-                        vertices_.at(circle->radius_point) = lift(radius_point);
-                        updated_vertices = true;
-                    }else if(const auto *arc = dynamic_cast<const arc_primitive_t*>(primitive(distance->primitive)); arc != nullptr){
-                        const auto centre = project(vertex(arc->center));
-                        auto start = project(vertex(arc->start));
-                        auto stop = project(vertex(arc->stop));
-                        auto start_u = start.u - centre.u;
-                        auto start_v = start.v - centre.v;
-                        auto stop_u = stop.u - centre.u;
-                        auto stop_v = stop.v - centre.v;
-                        const auto start_len = std::hypot(start_u, start_v);
-                        const auto stop_len = std::hypot(stop_u, stop_v);
-                        if(start_len <= std::numeric_limits<double>::epsilon()){
-                            start_u = 1.0;
-                            start_v = 0.0;
-                        }else{
-                            start_u /= start_len;
-                            start_v /= start_len;
-                        }
-                        if(stop_len <= std::numeric_limits<double>::epsilon()){
-                            stop_u = 1.0;
-                            stop_v = 0.0;
-                        }else{
-                            stop_u /= stop_len;
-                            stop_v /= stop_len;
-                        }
-                        start.u = centre.u + start_u * distance->target_distance;
-                        start.v = centre.v + start_v * distance->target_distance;
-                        stop.u = centre.u + stop_u * distance->target_distance;
-                        stop.v = centre.v + stop_v * distance->target_distance;
-                        vertices_.at(arc->start) = lift(start);
-                        vertices_.at(arc->stop) = lift(stop);
-                        updated_vertices = true;
-                    }
-
-                }else if(const auto *parallel = dynamic_cast<const parallel_constraint_t*>(constraint_ptr.get()); parallel != nullptr){
-                    const auto *line_a = dynamic_cast<const line_primitive_t*>(primitive(parallel->line_a));
-                    const auto *line_b = dynamic_cast<const line_primitive_t*>(primitive(parallel->line_b));
-                    if((line_a == nullptr) || (line_b == nullptr)) continue;
-                    const auto a0 = project(vertex(line_a->vertices[0]));
-                    const auto a1 = project(vertex(line_a->vertices[1]));
-                    auto b0 = project(vertex(line_b->vertices[0]));
-                    auto b1 = project(vertex(line_b->vertices[1]));
-                    auto dir_u = a1.u - a0.u;
-                    auto dir_v = a1.v - a0.v;
-                    const auto dir_len = std::hypot(dir_u, dir_v);
-                    auto len_b = std::hypot(b1.u - b0.u, b1.v - b0.v);
-                    if((dir_len <= std::numeric_limits<double>::epsilon()) || (len_b <= std::numeric_limits<double>::epsilon())){
-                        continue;
-                    }
-                    dir_u /= dir_len;
-                    dir_v /= dir_len;
-                    std::tie(dir_u, dir_v) = orient_unit_direction(b1.u - b0.u,
-                                                                   b1.v - b0.v,
-                                                                   dir_u,
-                                                                   dir_v);
-                    b1.u = b0.u + dir_u * len_b;
-                    b1.v = b0.v + dir_v * len_b;
-                    vertices_.at(line_b->vertices[1]) = lift(b1);
-                    updated_vertices = true;
-
-                }else if(const auto *perpendicular = dynamic_cast<const perpendicular_constraint_t*>(constraint_ptr.get()); perpendicular != nullptr){
-                    const auto *line_a = dynamic_cast<const line_primitive_t*>(primitive(perpendicular->line_a));
-                    const auto *line_b = dynamic_cast<const line_primitive_t*>(primitive(perpendicular->line_b));
-                    if((line_a == nullptr) || (line_b == nullptr)) continue;
-                    const auto a0 = project(vertex(line_a->vertices[0]));
-                    const auto a1 = project(vertex(line_a->vertices[1]));
-                    auto b0 = project(vertex(line_b->vertices[0]));
-                    auto b1 = project(vertex(line_b->vertices[1]));
-                    auto dir_u = a1.u - a0.u;
-                    auto dir_v = a1.v - a0.v;
-                    const auto dir_len = std::hypot(dir_u, dir_v);
-                    auto len_b = std::hypot(b1.u - b0.u, b1.v - b0.v);
-                    if((dir_len <= std::numeric_limits<double>::epsilon()) || (len_b <= std::numeric_limits<double>::epsilon())){
-                        continue;
-                    }
-                    dir_u /= dir_len;
-                    dir_v /= dir_len;
-                    const auto perp_u = -dir_v;
-                    const auto perp_v = dir_u;
-                    auto [oriented_perp_u, oriented_perp_v] = orient_unit_direction(b1.u - b0.u,
-                                                                                    b1.v - b0.v,
-                                                                                    perp_u,
-                                                                                    perp_v);
-                    b1.u = b0.u + oriented_perp_u * len_b;
-                    b1.v = b0.v + oriented_perp_v * len_b;
-                    vertices_.at(line_b->vertices[1]) = lift(b1);
-                    updated_vertices = true;
-
-                }else if(const auto *mirror = dynamic_cast<const mirror_constraint_t*>(constraint_ptr.get()); mirror != nullptr){
-                    const auto *line = dynamic_cast<const line_primitive_t*>(primitive(mirror->line));
-                    if((line == nullptr) || !vertex_index_valid(mirror->vertex_a) || !vertex_index_valid(mirror->vertex_b)){
-                        continue;
-                    }
-                    const auto a = project(vertex(line->vertices[0]));
-                    const auto b = project(vertex(line->vertices[1]));
-                    const auto reflected = reflect_across_line(project(vertex(mirror->vertex_a)), a, b);
-                    vertices_.at(mirror->vertex_b) = lift(reflected);
-                    updated_vertices = true;
-
-                }else if(const auto *overlap = dynamic_cast<const overlap_constraint_t*>(constraint_ptr.get()); overlap != nullptr){
-                    if(!vertex_index_valid(overlap->vertex_a) || !vertex_index_valid(overlap->vertex_b)){
-                        continue;
-                    }
-                    vertices_.at(overlap->vertex_b) = vertices_.at(overlap->vertex_a);
-                    updated_vertices = true;
-                }
-            }
-            enforce_pinned_vertices();
-            if(updated_vertices){
-                refresh_all_derived_geometry();
-            }else{
-                break;
-            }
-        }
-    }
-    refresh_all_derived_geometry();
-    if(solve_with_bounds){
-        clamp_vertices_to_bounds(options.bounds.value());
-    }
-
-    std::vector<residual_block_t> final_blocks;
-    std::size_t final_enabled_constraints = 0U;
-    auto final_state = context.initial_state();
-    for(std::size_t vertex_idx = 0U; vertex_idx < vertices_.size(); ++vertex_idx){
-        const auto base = vertex_idx * 2U;
-        const auto projected = project(vertices_.at(vertex_idx));
-        final_state.at(base) = projected.u;
-        final_state.at(base + 1U) = projected.v;
-    }
-    const auto final_residuals = context.residual_vector(final_state, &final_blocks, &final_enabled_constraints);
-    last_solve_report_.enabled_constraints = final_enabled_constraints;
-    last_solve_report_.residual_count = final_residuals.size();
-
-    const auto tolerance = std::max(options.residual_tolerance, solver_min_epsilon);
-    for(const auto &block : final_blocks){
-        if(block.sticky) continue;
-        double block_norm_sq = 0.0;
-        for(std::size_t i = 0U; i < block.count; ++i){
-            block_norm_sq += final_residuals.at(block.begin + i) * final_residuals.at(block.begin + i);
-        }
-        if(std::sqrt(block_norm_sq) > tolerance){
-            ++last_solve_report_.unresolved_constraints;
-        }
-    }
-
-#ifdef DCMA_USE_EIGEN
-    last_solve_report_.used_svd = false;
-    if(last_solve_report_.unresolved_constraints != 0U){
-        std::size_t diagnostic_row_count = 0U;
-        for(const auto &block : final_blocks){
-            if(block.sticky) continue;
-            diagnostic_row_count += block.count;
-        }
-
-        if(diagnostic_row_count > 0U){
-            const auto jacobian = context.jacobian(final_state);
-            if((jacobian.dense.rows() >= static_cast<Eigen::Index>(diagnostic_row_count))
-            && (jacobian.dense.cols() > 0)){
-                Eigen::MatrixXd diagnostic_jacobian(static_cast<Eigen::Index>(diagnostic_row_count),
-                                                   jacobian.dense.cols());
-                Eigen::VectorXd residual_vector(static_cast<Eigen::Index>(diagnostic_row_count));
-
-                Eigen::Index diagnostic_row = 0;
-                for(const auto &block : final_blocks){
-                    if(block.sticky) continue;
-                    for(std::size_t i = 0U; i < block.count; ++i, ++diagnostic_row){
-                        const auto source_row = static_cast<Eigen::Index>(block.begin + i);
-                        diagnostic_jacobian.row(diagnostic_row) = jacobian.dense.row(source_row);
-                        residual_vector(diagnostic_row) = final_residuals.at(block.begin + i);
-                    }
-                }
-
-                last_solve_report_.used_svd = true;
-                Eigen::BDCSVD<Eigen::MatrixXd> svd(diagnostic_jacobian, Eigen::ComputeThinU | Eigen::ComputeThinV);
-                const auto singular_values = svd.singularValues();
-                if(singular_values.size() > 0){
-                    const auto max_singular = singular_values(0);
-                    const auto rank_tolerance = std::numeric_limits<double>::epsilon()
-                                              * static_cast<double>(std::max(diagnostic_jacobian.rows(), diagnostic_jacobian.cols()))
-                                              * std::max(max_singular, 1.0);
-                    last_solve_report_.jacobian_rank = static_cast<std::size_t>((singular_values.array() > rank_tolerance).count());
-
-                    if(last_solve_report_.jacobian_rank > 0U){
-                        const auto active_u = svd.matrixU().leftCols(static_cast<Eigen::Index>(last_solve_report_.jacobian_rank));
-                        const auto projected_residuals = active_u * (active_u.transpose() * residual_vector);
-                        last_solve_report_.conflict_norm = (residual_vector - projected_residuals).norm();
-                    }else{
-                        last_solve_report_.conflict_norm = residual_vector.norm();
-                    }
-                    // Treat large off-subspace residual energy as a genuine conflict only when at least one
-                    // user-facing constraint also remains unsatisfied; this avoids flagging benign rank
-                    // deficiency or slow-but-feasible convergence as a hard conflict.
-                    last_solve_report_.conflicting_constraints = (last_solve_report_.conflict_norm > tolerance)
-                                                              && (last_solve_report_.unresolved_constraints != 0U);
-                }
-            }
-        }
-    }
-#endif // DCMA_USE_EIGEN
-
-    return last_solve_report_.unresolved_constraints;
+    return sketch_constraints::solve_constraints(*this, options, last_solve_report_);
 }
 
 const Sketch::solve_report_t&
@@ -3339,121 +1648,7 @@ Sketch::build_extruded_surface_mesh(const extrusion_options_t &options,
                                     fv_surface_mesh<double, uint64_t> &mesh,
                                     std::vector<fv_surface_mesh<double, uint64_t>> *cap_meshes,
                                     std::string *error_message) const{
-    mesh = {};
-    if(cap_meshes != nullptr) cap_meshes->clear();
-
-    if(!has_plane_){
-        store_error(error_message, "Unable to extrude sketch without an embedded plane");
-        return false;
-    }
-    if(!std::isfinite(options.into_frame_length)
-    || !std::isfinite(options.out_of_frame_length)
-    || !std::isfinite(options.into_frame_angle_degrees)
-    || !std::isfinite(options.out_of_frame_angle_degrees)){
-        store_error(error_message, "Extrusion lengths and angles must be finite");
-        return false;
-    }
-    if((options.into_frame_length + options.out_of_frame_length) <= solver_min_epsilon){
-        store_error(error_message,
-                    "Extrusion lengths may be negative, but they must sum to a positive distance between the caps");
-        return false;
-    }
-
-    const double near_offset = -options.out_of_frame_length;
-    const double far_offset = options.into_frame_length;
-    try{
-        std::size_t computed_segments = options.curve_segments;
-        if(std::isfinite(options.max_discretization_error) && (options.max_discretization_error > 0.0)){
-            computed_segments = 16U;
-            for(std::size_t i = 0U; i < primitive_count(); ++i){
-                const auto *p = primitive(i);
-                if(!p || p->kind() == primitive_kind_t::vertex) continue;
-                if(p->tag == geometry_tag_t::support) continue;
-                computed_segments = std::max(computed_segments,
-                    compute_discretization_segments(*this, i, options.max_discretization_error, 1024U));
-            }
-        }
-        const auto curve_segments = std::max<std::size_t>(computed_segments, 16U);
-        const auto paths = collect_extruded_paths(*this, curve_segments);
-        const auto bounds = projected_path_bounds(*this, paths);
-        if(!bounds.is_valid()){
-            store_error(error_message, "Sketch does not contain any extrudable primitives");
-            return false;
-        }
-
-        const Sketch::projection_t scale_centre = {
-            (bounds.min.u + bounds.max.u) * 0.5,
-            (bounds.min.v + bounds.max.v) * 0.5
-        };
-        const auto half_extent_u = std::max(0.0, (bounds.max.u - bounds.min.u) * 0.5);
-        const auto half_extent_v = std::max(0.0, (bounds.max.v - bounds.min.v) * 0.5);
-        const auto reference_half_extent = std::max(half_extent_u, half_extent_v);
-        const auto near_scale = extrusion_scale_factor(reference_half_extent,
-                                                       options.out_of_frame_length,
-                                                       options.out_of_frame_angle_degrees);
-        const auto far_scale = extrusion_scale_factor(reference_half_extent,
-                                                      options.into_frame_length,
-                                                      options.into_frame_angle_degrees);
-        if(!std::isfinite(near_scale) || !std::isfinite(far_scale)){
-            store_error(error_message, "Extrusion scale factors must be finite");
-            return false;
-        }
-        if((near_scale <= solver_min_epsilon) || (far_scale <= solver_min_epsilon)){
-            store_error(error_message,
-                        "Extrusion angles narrow the sketch past collapse; reduce the magnitude of the narrowing angle");
-            return false;
-        }
-
-        bool emitted_geometry = false;
-        for(const auto &path : paths){
-            append_extruded_polyline_sides(*this,
-                                           path,
-                                           scale_centre,
-                                           near_offset,
-                                           far_offset,
-                                           near_scale,
-                                           far_scale,
-                                           mesh);
-            emitted_geometry = emitted_geometry || !path.points.empty();
-        }
-        append_extruded_end_caps(*this,
-                                 paths,
-                                 scale_centre,
-                                 near_offset,
-                                 far_offset,
-                                 near_scale,
-                                 far_scale,
-                                 mesh,
-                                 cap_meshes);
-
-        if(!emitted_geometry || mesh.faces.empty()){
-            store_error(error_message, "Sketch does not contain any extrudable primitives");
-            mesh = {};
-            if(cap_meshes != nullptr) cap_meshes->clear();
-            return false;
-        }
-        mesh.recreate_involved_face_index();
-
-        // Post-process the extruded mesh to remove internal faces and ensure
-        // consistent normal orientation. Internal faces are detected as faces
-        // whose edges are all shared by at least two faces. Such faces do not
-        // contribute to the exterior surface and make the mesh non-manifold.
-        remove_internal_mesh_faces(mesh);
-
-        return true;
-    }catch(const std::exception &e){
-        YLOGWARN("Sketch extrusion failed with exception: '" << e.what() << "'");
-        mesh = {};
-        if(cap_meshes != nullptr) cap_meshes->clear();
-        store_error(error_message, std::string("Sketch extrusion failed: ") + e.what());
-        return false;
-    }catch(...){
-        YLOGWARN("Sketch extrusion failed with an unknown exception");
-        mesh = {};
-        if(cap_meshes != nullptr) cap_meshes->clear();
-        store_error(error_message, "Sketch extrusion failed with an unknown exception");
-        return false;
-    }
+    return sketch_extrude::build_extruded_surface_mesh(*this, options, mesh, cap_meshes, error_message);
 }
 
 std::string
@@ -3473,7 +1668,13 @@ Sketch::describe_constraint(constraint_index_t idx) const{
             if(const auto *distance = dynamic_cast<const distance_constraint_t*>(c); distance != nullptr){
                 if(dynamic_cast<const line_primitive_t*>(primitive(distance->primitive)) != nullptr){
                     ss << "length";
-                }else if(get_round_binding(*this, distance->primitive)){
+                }else if([&](){
+                    if(const auto *prim = primitive(distance->primitive); prim != nullptr){
+                        return dynamic_cast<const circle_primitive_t*>(prim) != nullptr
+                            || dynamic_cast<const arc_primitive_t*>(prim) != nullptr;
+                    }
+                    return false;
+                }()){
                     ss << "radius";
                 }else{
                     ss << "distance";
@@ -3505,262 +1706,287 @@ Sketch::describe_constraint(constraint_index_t idx) const{
 }
 
 bool
-Sketch::save_to_file(const std::filesystem::path &path,
-                     std::string *error_message) const{
-    std::ofstream file(path);
-    if(!file){
-        store_error(error_message, "Unable to open sketch file for writing");
-        return false;
-    }
-    file << std::setprecision(std::numeric_limits<double>::max_digits10);
-
-    file << "DCMA_SKETCH 1\n";
-    file << "plane " << (has_plane_ ? 1 : 0) << '\n';
-    if(has_plane_){
-        file << "origin " << plane_.origin.x << ' ' << plane_.origin.y << ' ' << plane_.origin.z << '\n';
-        file << "row " << plane_.row_unit.x << ' ' << plane_.row_unit.y << ' ' << plane_.row_unit.z << '\n';
-        file << "col " << plane_.col_unit.x << ' ' << plane_.col_unit.y << ' ' << plane_.col_unit.z << '\n';
-    }
-
-    file << "vertices " << vertices_.size() << '\n';
-    for(const auto &vertex : vertices_){
-        file << vertex.x << ' ' << vertex.y << ' ' << vertex.z << '\n';
-    }
-
-    file << "primitives " << primitives_.size() << '\n';
-    for(const auto &primitive_ptr : primitives_){
-        if(const auto *vertex_primitive = dynamic_cast<const vertex_primitive_t*>(primitive_ptr.get()); vertex_primitive != nullptr){
-            file << "vertex " << geometry_tag_to_string(vertex_primitive->tag) << ' ' << vertex_primitive->vertex << '\n';
-        }else if(const auto *line = dynamic_cast<const line_primitive_t*>(primitive_ptr.get()); line != nullptr){
-            file << "line " << geometry_tag_to_string(line->tag) << ' ' << line->vertices[0] << ' ' << line->vertices[1] << '\n';
-        }else if(const auto *circle = dynamic_cast<const circle_primitive_t*>(primitive_ptr.get()); circle != nullptr){
-            file << "circle " << geometry_tag_to_string(circle->tag) << ' ' << circle->center << ' ' << circle->radius_point << '\n';
-        }else if(const auto *arc = dynamic_cast<const arc_primitive_t*>(primitive_ptr.get()); arc != nullptr){
-            file << "arc " << geometry_tag_to_string(arc->tag) << ' ' << arc->center << ' ' << arc->start << ' ' << arc->stop << '\n';
-        }else if(const auto *bezier = dynamic_cast<const bezier_primitive_t*>(primitive_ptr.get()); bezier != nullptr){
-            file << "bezier " << geometry_tag_to_string(bezier->tag)
-                 << ' ' << bezier->control_vertices[0]
-                 << ' ' << bezier->control_vertices[1]
-                 << ' ' << bezier->control_vertices[2]
-                 << ' ' << bezier->control_vertices[3] << '\n';
-        }else{
-            store_error(error_message, "Encountered unsupported sketch primitive while saving");
+Sketch::save_to_file(const std::filesystem::path &path, std::string *error_message) const{
+    try{
+        std::ofstream fout(path);
+        if(!fout.is_open() || !fout.good()){
+            store_error(error_message, "Unable to open file for writing");
             return false;
         }
-    }
+        fout << "sketch_format_version 1\n";
 
-    file << "constraints " << constraints_.size() << '\n';
-    for(const auto &constraint_ptr : constraints_){
-        if(const auto *horizontal = dynamic_cast<const horizontal_constraint_t*>(constraint_ptr.get()); horizontal != nullptr){
-            file << "horizontal " << (horizontal->enabled ? 1 : 0) << ' ' << horizontal->line << '\n';
-        }else if(const auto *vertical = dynamic_cast<const vertical_constraint_t*>(constraint_ptr.get()); vertical != nullptr){
-            file << "vertical " << (vertical->enabled ? 1 : 0) << ' ' << vertical->line << '\n';
-        }else if(const auto *distance = dynamic_cast<const distance_constraint_t*>(constraint_ptr.get()); distance != nullptr){
-            file << "distance " << (distance->enabled ? 1 : 0) << ' ' << distance->primitive << ' ' << distance->target_distance << '\n';
-        }else if(const auto *parallel = dynamic_cast<const parallel_constraint_t*>(constraint_ptr.get()); parallel != nullptr){
-            file << "parallel " << (parallel->enabled ? 1 : 0) << ' ' << parallel->line_a << ' ' << parallel->line_b << '\n';
-        }else if(const auto *perpendicular = dynamic_cast<const perpendicular_constraint_t*>(constraint_ptr.get()); perpendicular != nullptr){
-            file << "perpendicular " << (perpendicular->enabled ? 1 : 0) << ' ' << perpendicular->line_a << ' ' << perpendicular->line_b << '\n';
-        }else if(const auto *pin = dynamic_cast<const pin_constraint_t*>(constraint_ptr.get()); pin != nullptr){
-            file << "pin " << (pin->enabled ? 1 : 0) << ' ' << pin->vertex
-                 << ' ' << pin->pinned_position.x
-                 << ' ' << pin->pinned_position.y
-                 << ' ' << pin->pinned_position.z << '\n';
-        }else if(const auto *tangent = dynamic_cast<const tangent_constraint_t*>(constraint_ptr.get()); tangent != nullptr){
-            file << "tangent " << (tangent->enabled ? 1 : 0) << ' ' << tangent->primitive_a << ' ' << tangent->primitive_b << '\n';
-        }else if(const auto *mirror = dynamic_cast<const mirror_constraint_t*>(constraint_ptr.get()); mirror != nullptr){
-            file << "mirror " << (mirror->enabled ? 1 : 0) << ' ' << mirror->line << ' ' << mirror->vertex_a << ' ' << mirror->vertex_b << '\n';
-        }else if(const auto *overlap = dynamic_cast<const overlap_constraint_t*>(constraint_ptr.get()); overlap != nullptr){
-            file << "overlap " << (overlap->enabled ? 1 : 0) << ' ' << overlap->vertex_a << ' ' << overlap->vertex_b << '\n';
-        }else{
-            store_error(error_message, "Encountered unsupported sketch constraint while saving");
-            return false;
+        const auto &p = plane();
+        fout << "plane_origin " << p.origin.x << " " << p.origin.y << " " << p.origin.z << "\n";
+        fout << "plane_row_unit " << p.row_unit.x << " " << p.row_unit.y << " " << p.row_unit.z << "\n";
+        fout << "plane_col_unit " << p.col_unit.x << " " << p.col_unit.y << " " << p.col_unit.z << "\n";
+
+        for(std::size_t i = 0U; i < vertices_.size(); ++i){
+            const auto &v = vertices_.at(i);
+            fout << "vertex " << i << " " << v.x << " " << v.y << " " << v.z << "\n";
         }
-    }
 
-    if(!file){
-        store_error(error_message, "Failed while writing sketch file");
+        for(std::size_t i = 0U; i < primitives_.size(); ++i){
+            const auto *prim_ptr = primitives_.at(i).get();
+            if(prim_ptr == nullptr) continue;
+            const auto tag_str = geometry_tag_to_string(prim_ptr->tag);
+            if(const auto *vp = dynamic_cast<const vertex_primitive_t*>(prim_ptr); vp != nullptr){
+                fout << "primitive vertex " << i << " " << tag_str << " " << vp->vertex << "\n";
+            }else if(const auto *lp = dynamic_cast<const line_primitive_t*>(prim_ptr); lp != nullptr){
+                fout << "primitive line " << i << " " << tag_str << " " << lp->vertices[0] << " " << lp->vertices[1] << "\n";
+            }else if(const auto *cp = dynamic_cast<const circle_primitive_t*>(prim_ptr); cp != nullptr){
+                fout << "primitive circle " << i << " " << tag_str << " " << cp->center << " " << cp->radius_point << "\n";
+            }else if(const auto *ap = dynamic_cast<const arc_primitive_t*>(prim_ptr); ap != nullptr){
+                fout << "primitive arc " << i << " " << tag_str << " " << ap->center << " " << ap->start << " " << ap->stop << "\n";
+            }else if(const auto *bp = dynamic_cast<const bezier_primitive_t*>(prim_ptr); bp != nullptr){
+                fout << "primitive bezier " << i << " " << tag_str;
+                for(const auto &v : bp->control_vertices) fout << " " << v;
+                fout << "\n";
+            }
+        }
+
+        for(std::size_t i = 0U; i < constraints_.size(); ++i){
+            const auto *c = constraints_.at(i).get();
+            if(c == nullptr) continue;
+            if(const auto *hc = dynamic_cast<const horizontal_constraint_t*>(c); hc != nullptr){
+                fout << "constraint horizontal " << i << " " << (hc->enabled ? "enabled" : "disabled") << " " << hc->line << "\n";
+            }else if(const auto *vc = dynamic_cast<const vertical_constraint_t*>(c); vc != nullptr){
+                fout << "constraint vertical " << i << " " << (vc->enabled ? "enabled" : "disabled") << " " << vc->line << "\n";
+            }else if(const auto *dc = dynamic_cast<const distance_constraint_t*>(c); dc != nullptr){
+                fout << "constraint distance " << i << " " << (dc->enabled ? "enabled" : "disabled") << " " << dc->primitive << " " << dc->target_distance << "\n";
+            }else if(const auto *pc = dynamic_cast<const parallel_constraint_t*>(c); pc != nullptr){
+                fout << "constraint parallel " << i << " " << (pc->enabled ? "enabled" : "disabled") << " " << pc->line_a << " " << pc->line_b << "\n";
+            }else if(const auto *ppc = dynamic_cast<const perpendicular_constraint_t*>(c); ppc != nullptr){
+                fout << "constraint perpendicular " << i << " " << (ppc->enabled ? "enabled" : "disabled") << " " << ppc->line_a << " " << ppc->line_b << "\n";
+            }else if(const auto *pic = dynamic_cast<const pin_constraint_t*>(c); pic != nullptr){
+                fout << "constraint pin " << i << " " << (pic->enabled ? "enabled" : "disabled") << " " << pic->vertex << " "
+                     << pic->pinned_position.x << " " << pic->pinned_position.y << " " << pic->pinned_position.z << "\n";
+            }else if(const auto *tc = dynamic_cast<const tangent_constraint_t*>(c); tc != nullptr){
+                fout << "constraint tangent " << i << " " << (tc->enabled ? "enabled" : "disabled") << " " << tc->primitive_a << " " << tc->primitive_b << "\n";
+            }else if(const auto *mc = dynamic_cast<const mirror_constraint_t*>(c); mc != nullptr){
+                fout << "constraint mirror " << i << " " << (mc->enabled ? "enabled" : "disabled") << " " << mc->line << " " << mc->vertex_a << " " << mc->vertex_b << "\n";
+            }else if(const auto *oc = dynamic_cast<const overlap_constraint_t*>(c); oc != nullptr){
+                fout << "constraint overlap " << i << " " << (oc->enabled ? "enabled" : "disabled") << " " << oc->vertex_a << " " << oc->vertex_b << "\n";
+            }
+        }
+
+        fout.close();
+        return true;
+    }catch(const std::exception &e){
+        store_error(error_message, std::string("Exception while saving sketch: ") + e.what());
         return false;
     }
-    return true;
 }
 
 bool
-Sketch::load_from_file(const std::filesystem::path &path,
-                       Sketch &out,
-                       std::string *error_message){
-    std::ifstream file(path);
-    if(!file){
-        store_error(error_message, "Unable to open sketch file for reading");
+Sketch::load_from_file(const std::filesystem::path &path, Sketch &out, std::string *error_message){
+    out.clear();
+    try{
+        std::ifstream fin(path);
+        if(!fin.is_open() || !fin.good()){
+            store_error(error_message, "Unable to open file for reading");
+            return false;
+        }
+
+        std::string line;
+        bool plane_set = false;
+        while(std::getline(fin, line)){
+            std::istringstream iss(line);
+            std::string keyword;
+            iss >> keyword;
+            if(keyword == "sketch_format_version"){
+                int version = 0;
+                iss >> version;
+                if(version != 1){
+                    store_error(error_message, "Unsupported sketch format version");
+                    return false;
+                }
+            }else if(keyword == "plane_origin"){
+                double x, y, z;
+                if(iss >> x >> y >> z){
+                    out.plane_.origin = vec3<double>(x, y, z);
+                }
+            }else if(keyword == "plane_row_unit"){
+                double x, y, z;
+                if(iss >> x >> y >> z){
+                    out.plane_.row_unit = vec3<double>(x, y, z);
+                }
+            }else if(keyword == "plane_col_unit"){
+                double x, y, z;
+                if(iss >> x >> y >> z){
+                    out.plane_.col_unit = vec3<double>(x, y, z);
+                    plane_set = true;
+                }
+            }else if(keyword == "vertex"){
+                std::size_t idx = 0U;
+                double x, y, z;
+                if(iss >> idx >> x >> y >> z){
+                    if(idx >= out.vertices_.size()){
+                        out.vertices_.resize(idx + 1U);
+                    }
+                    out.vertices_.at(idx) = vec3<double>(x, y, z);
+                }
+            }else if(keyword == "primitive"){
+                std::string prim_type;
+                std::size_t idx = 0U;
+                std::string tag_str;
+                iss >> prim_type >> idx >> tag_str;
+                geometry_tag_t tag = geometry_tag_t::normal;
+                parse_geometry_tag(tag_str, tag);
+
+                auto make_primitive = [&](auto p) -> void {
+                    if(idx >= out.primitives_.size()){
+                        out.primitives_.resize(idx + 1U);
+                    }
+                    out.primitives_.at(idx) = std::move(p);
+                };
+
+                if(prim_type == "vertex"){
+                    std::size_t vertex = 0U;
+                    if(iss >> vertex){
+                        auto p = std::make_unique<vertex_primitive_t>();
+                        p->tag = tag;
+                        p->vertex = vertex;
+                        make_primitive(std::move(p));
+                    }
+                }else if(prim_type == "line"){
+                    std::size_t v0, v1;
+                    if(iss >> v0 >> v1){
+                        auto p = std::make_unique<line_primitive_t>();
+                        p->tag = tag;
+                        p->vertices = { v0, v1 };
+                        make_primitive(std::move(p));
+                    }
+                }else if(prim_type == "circle"){
+                    std::size_t center, radius_point;
+                    if(iss >> center >> radius_point){
+                        auto p = std::make_unique<circle_primitive_t>();
+                        p->tag = tag;
+                        p->center = center;
+                        p->radius_point = radius_point;
+                        make_primitive(std::move(p));
+                    }
+                }else if(prim_type == "arc"){
+                    std::size_t center, start, stop;
+                    if(iss >> center >> start >> stop){
+                        auto p = std::make_unique<arc_primitive_t>();
+                        p->tag = tag;
+                        p->center = center;
+                        p->start = start;
+                        p->stop = stop;
+                        make_primitive(std::move(p));
+                    }
+                }else if(prim_type == "bezier"){
+                    std::array<std::size_t, 4> cvs = {};
+                    if(iss >> cvs[0] >> cvs[1] >> cvs[2] >> cvs[3]){
+                        auto p = std::make_unique<bezier_primitive_t>();
+                        p->tag = tag;
+                        p->control_vertices = cvs;
+                        make_primitive(std::move(p));
+                    }
+                }
+            }else if(keyword == "constraint"){
+                std::string constraint_type;
+                std::size_t idx = 0U;
+                std::string enabled_str;
+                iss >> constraint_type >> idx >> enabled_str;
+                bool enabled = (enabled_str == "enabled");
+
+                auto make_constraint = [&](auto c) -> void {
+                    if(idx >= out.constraints_.size()){
+                        out.constraints_.resize(idx + 1U);
+                    }
+                    c->enabled = enabled;
+                    out.constraints_.at(idx) = std::move(c);
+                };
+
+                if(constraint_type == "horizontal"){
+                    std::size_t line = 0U;
+                    if(iss >> line){
+                        auto c = std::make_unique<horizontal_constraint_t>();
+                        c->line = line;
+                        make_constraint(std::move(c));
+                    }
+                }else if(constraint_type == "vertical"){
+                    std::size_t line = 0U;
+                    if(iss >> line){
+                        auto c = std::make_unique<vertical_constraint_t>();
+                        c->line = line;
+                        make_constraint(std::move(c));
+                    }
+                }else if(constraint_type == "distance"){
+                    std::size_t primitive_idx = 0U;
+                    double target_distance = 0.0;
+                    if(iss >> primitive_idx >> target_distance){
+                        auto c = std::make_unique<distance_constraint_t>();
+                        c->primitive = primitive_idx;
+                        c->target_distance = target_distance;
+                        make_constraint(std::move(c));
+                    }
+                }else if(constraint_type == "parallel"){
+                    std::size_t line_a, line_b;
+                    if(iss >> line_a >> line_b){
+                        auto c = std::make_unique<parallel_constraint_t>();
+                        c->line_a = line_a;
+                        c->line_b = line_b;
+                        make_constraint(std::move(c));
+                    }
+                }else if(constraint_type == "perpendicular"){
+                    std::size_t line_a, line_b;
+                    if(iss >> line_a >> line_b){
+                        auto c = std::make_unique<perpendicular_constraint_t>();
+                        c->line_a = line_a;
+                        c->line_b = line_b;
+                        make_constraint(std::move(c));
+                    }
+                }else if(constraint_type == "pin"){
+                    std::size_t vertex_idx = 0U;
+                    double x, y, z;
+                    if(iss >> vertex_idx >> x >> y >> z){
+                        auto c = std::make_unique<pin_constraint_t>();
+                        c->vertex = vertex_idx;
+                        c->pinned_position = vec3<double>(x, y, z);
+                        make_constraint(std::move(c));
+                    }
+                }else if(constraint_type == "tangent"){
+                    std::size_t pa, pb;
+                    if(iss >> pa >> pb){
+                        auto c = std::make_unique<tangent_constraint_t>();
+                        c->primitive_a = pa;
+                        c->primitive_b = pb;
+                        make_constraint(std::move(c));
+                    }
+                }else if(constraint_type == "mirror"){
+                    std::size_t line, va, vb;
+                    if(iss >> line >> va >> vb){
+                        auto c = std::make_unique<mirror_constraint_t>();
+                        c->line = line;
+                        c->vertex_a = va;
+                        c->vertex_b = vb;
+                        make_constraint(std::move(c));
+                    }
+                }else if(constraint_type == "overlap"){
+                    std::size_t va, vb;
+                    if(iss >> va >> vb){
+                        auto c = std::make_unique<overlap_constraint_t>();
+                        c->vertex_a = va;
+                        c->vertex_b = vb;
+                        make_constraint(std::move(c));
+                    }
+                }
+            }
+        }
+
+        if(!plane_set){
+            store_error(error_message, "Sketch file does not contain a valid plane definition");
+            out.clear();
+            return false;
+        }
+        out.has_plane_ = true;
+        out.refresh_all_derived_geometry();
+        return true;
+    }catch(const std::exception &e){
+        store_error(error_message, std::string("Exception while loading sketch: ") + e.what());
+        out.clear();
         return false;
     }
-
-    auto fail = [&error_message](const std::string &message) -> bool {
-        store_error(error_message, message);
-        return false;
-    };
-
-    std::string header;
-    int version = 0;
-    if(!(file >> header >> version) || (header != "DCMA_SKETCH") || (version != 1)){
-        return fail("Unrecognized sketch file header");
-    }
-
-    Sketch loaded;
-
-    std::string token;
-    int has_plane = 0;
-    if(!(file >> token >> has_plane) || (token != "plane")){
-        return fail("Missing sketch plane header");
-    }
-    if(has_plane != 0){
-        plane_frame_t plane;
-        if(!(file >> token >> plane.origin.x >> plane.origin.y >> plane.origin.z) || (token != "origin")){
-            return fail("Unable to read sketch plane origin");
-        }
-        if(!(file >> token >> plane.row_unit.x >> plane.row_unit.y >> plane.row_unit.z) || (token != "row")){
-            return fail("Unable to read sketch plane row axis");
-        }
-        if(!(file >> token >> plane.col_unit.x >> plane.col_unit.y >> plane.col_unit.z) || (token != "col")){
-            return fail("Unable to read sketch plane column axis");
-        }
-        loaded.set_plane(plane);
-    }
-
-    std::size_t vertex_count = 0U;
-    if(!(file >> token >> vertex_count) || (token != "vertices")){
-        return fail("Missing sketch vertex section");
-    }
-    loaded.vertices_.reserve(vertex_count);
-    for(std::size_t i = 0U; i < vertex_count; ++i){
-        vec3<double> vertex;
-        if(!(file >> vertex.x >> vertex.y >> vertex.z)){
-            return fail("Unable to read sketch vertex");
-        }
-        loaded.vertices_.push_back(vertex);
-    }
-
-    std::size_t primitive_count = 0U;
-    if(!(file >> token >> primitive_count) || (token != "primitives")){
-        return fail("Missing sketch primitive section");
-    }
-    loaded.primitives_.reserve(primitive_count);
-    for(std::size_t i = 0U; i < primitive_count; ++i){
-        std::string kind_token;
-        std::string tag_token;
-        geometry_tag_t tag = geometry_tag_t::normal;
-        if(!(file >> kind_token >> tag_token) || !parse_geometry_tag(tag_token, tag)){
-            return fail("Unable to read sketch primitive header");
-        }
-
-        std::unique_ptr<primitive_t> primitive;
-        if(kind_token == "vertex"){
-            auto out_primitive = std::make_unique<vertex_primitive_t>();
-            if(!(file >> out_primitive->vertex)) return fail("Unable to read vertex primitive");
-            primitive = std::move(out_primitive);
-        }else if(kind_token == "line"){
-            auto out_primitive = std::make_unique<line_primitive_t>();
-            if(!(file >> out_primitive->vertices[0] >> out_primitive->vertices[1])) return fail("Unable to read line primitive");
-            primitive = std::move(out_primitive);
-        }else if(kind_token == "circle"){
-            auto out_primitive = std::make_unique<circle_primitive_t>();
-            if(!(file >> out_primitive->center >> out_primitive->radius_point)) return fail("Unable to read circle primitive");
-            primitive = std::move(out_primitive);
-        }else if(kind_token == "arc"){
-            auto out_primitive = std::make_unique<arc_primitive_t>();
-            if(!(file >> out_primitive->center >> out_primitive->start >> out_primitive->stop)) return fail("Unable to read arc primitive");
-            primitive = std::move(out_primitive);
-        }else if(kind_token == "bezier"){
-            auto out_primitive = std::make_unique<bezier_primitive_t>();
-            if(!(file >> out_primitive->control_vertices[0]
-                      >> out_primitive->control_vertices[1]
-                      >> out_primitive->control_vertices[2]
-                      >> out_primitive->control_vertices[3])) return fail("Unable to read bezier primitive");
-            primitive = std::move(out_primitive);
-        }else{
-            return fail("Unrecognized sketch primitive type");
-        }
-
-        primitive->tag = tag;
-        for(const auto vertex_idx : primitive->referenced_vertices()){
-            if(vertex_count <= vertex_idx){
-                return fail("Sketch primitive references an invalid vertex");
-            }
-        }
-        loaded.primitives_.push_back(std::move(primitive));
-    }
-
-    std::size_t constraint_count = 0U;
-    if(!(file >> token >> constraint_count) || (token != "constraints")){
-        return fail("Missing sketch constraint section");
-    }
-    loaded.constraints_.reserve(constraint_count);
-    for(std::size_t i = 0U; i < constraint_count; ++i){
-        std::string kind_token;
-        int enabled = 1;
-        if(!(file >> kind_token >> enabled)){
-            return fail("Unable to read sketch constraint header");
-        }
-
-        std::unique_ptr<constraint_t> constraint;
-        if(kind_token == "horizontal"){
-            auto out_constraint = std::make_unique<horizontal_constraint_t>();
-            if(!(file >> out_constraint->line)) return fail("Unable to read horizontal constraint");
-            constraint = std::move(out_constraint);
-        }else if(kind_token == "vertical"){
-            auto out_constraint = std::make_unique<vertical_constraint_t>();
-            if(!(file >> out_constraint->line)) return fail("Unable to read vertical constraint");
-            constraint = std::move(out_constraint);
-        }else if(kind_token == "distance"){
-            auto out_constraint = std::make_unique<distance_constraint_t>();
-            if(!(file >> out_constraint->primitive >> out_constraint->target_distance)) return fail("Unable to read distance constraint");
-            constraint = std::move(out_constraint);
-        }else if(kind_token == "parallel"){
-            auto out_constraint = std::make_unique<parallel_constraint_t>();
-            if(!(file >> out_constraint->line_a >> out_constraint->line_b)) return fail("Unable to read parallel constraint");
-            constraint = std::move(out_constraint);
-        }else if(kind_token == "perpendicular"){
-            auto out_constraint = std::make_unique<perpendicular_constraint_t>();
-            if(!(file >> out_constraint->line_a >> out_constraint->line_b)) return fail("Unable to read perpendicular constraint");
-            constraint = std::move(out_constraint);
-        }else if(kind_token == "pin"){
-            auto out_constraint = std::make_unique<pin_constraint_t>();
-            if(!(file >> out_constraint->vertex
-                      >> out_constraint->pinned_position.x
-                      >> out_constraint->pinned_position.y
-                      >> out_constraint->pinned_position.z)) return fail("Unable to read pin constraint");
-            constraint = std::move(out_constraint);
-        }else if(kind_token == "tangent"){
-            auto out_constraint = std::make_unique<tangent_constraint_t>();
-            if(!(file >> out_constraint->primitive_a >> out_constraint->primitive_b)) return fail("Unable to read tangent constraint");
-            constraint = std::move(out_constraint);
-        }else if(kind_token == "mirror"){
-            auto out_constraint = std::make_unique<mirror_constraint_t>();
-            if(!(file >> out_constraint->line >> out_constraint->vertex_a >> out_constraint->vertex_b)) return fail("Unable to read mirror constraint");
-            constraint = std::move(out_constraint);
-        }else if(kind_token == "overlap"){
-            auto out_constraint = std::make_unique<overlap_constraint_t>();
-            if(!(file >> out_constraint->vertex_a >> out_constraint->vertex_b)) return fail("Unable to read overlap constraint");
-            constraint = std::move(out_constraint);
-        }else{
-            return fail("Unrecognized sketch constraint type");
-        }
-
-        constraint->enabled = (enabled != 0);
-        for(const auto primitive_idx : constraint->referenced_primitives()){
-            if(primitive_count <= primitive_idx){
-                return fail("Sketch constraint references an invalid primitive");
-            }
-        }
-        for(const auto vertex_idx : constraint->referenced_vertices()){
-            if(vertex_count <= vertex_idx){
-                return fail("Sketch constraint references an invalid vertex");
-            }
-        }
-        loaded.constraints_.push_back(std::move(constraint));
-    }
-
-    loaded.refresh_all_derived_geometry();
-    out = std::move(loaded);
-    return true;
 }

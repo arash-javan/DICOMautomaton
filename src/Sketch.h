@@ -16,11 +16,17 @@
 
 #include "YgorMath.h"
 
+#include "Sketch_Extrude.h"
+#include "Sketch_Fillets.h"
+
 class Sketch {
 public:
     using vertex_index_t = std::size_t;
     using primitive_index_t = std::size_t;
     using constraint_index_t = std::size_t;
+
+    // Type aliases for types migrated to namespace-scoped types.
+    using extrusion_options_t = sketch_extrude::extrusion_options_t;
 
     enum class geometry_tag_t {
         normal,
@@ -70,15 +76,6 @@ public:
         bool contains(const bounding_box_t &b) const;
     };
 
-    struct dof_summary_t {
-        std::size_t total = 0U;
-        std::size_t constrained = 0U;
-        std::size_t remaining = 0U;
-        std::size_t overconstrained = 0U;
-        std::size_t enabled_constraints = 0U;
-        std::size_t disabled_constraints = 0U;
-    };
-
     struct solve_options_t {
         // LM generally needs more iterations than the legacy projection-only placeholder solver.
         std::size_t max_iterations = 128U;
@@ -96,18 +93,6 @@ public:
         double lambda_decrease_factor = 0.1;
     };
 
-    struct extrusion_options_t {
-        // Positive values extrude away from the sketch plane along the named direction.
-        // Negative values are also legitimate and allow the user to place either cap on the
-        // opposite side of the sketch plane, provided the combined span remains positive.
-        double into_frame_length = 10.0;
-        double out_of_frame_length = 10.0;
-        double into_frame_angle_degrees = 0.0;
-        double out_of_frame_angle_degrees = 0.0;
-        std::size_t curve_segments = 48U;
-        double max_discretization_error = 0.1;
-    };
-
     struct solve_report_t {
         std::size_t unresolved_constraints = 0U;
         std::size_t enabled_constraints = 0U;
@@ -120,6 +105,15 @@ public:
         bool used_svd = false;
         bool conflicting_constraints = false;
         std::string reason;
+    };
+
+    struct dof_summary_t {
+        std::size_t total = 0U;
+        std::size_t constrained = 0U;
+        std::size_t remaining = 0U;
+        std::size_t overconstrained = 0U;
+        std::size_t enabled_constraints = 0U;
+        std::size_t disabled_constraints = 0U;
     };
 
     struct primitive_t {
@@ -366,6 +360,10 @@ public:
     bool save_to_file(const std::filesystem::path &path, std::string *error_message = nullptr) const;
     static bool load_from_file(const std::filesystem::path &path, Sketch &out, std::string *error_message = nullptr);
 
+    // Called by the constraint solver (sketch_constraints namespace) to restore
+    // pinned vertices after each refinement pass.
+    void enforce_pinned_vertices();
+
 private:
     std::vector<vec3<double>> vertices_;
     std::vector<std::unique_ptr<primitive_t>> primitives_;
@@ -380,7 +378,6 @@ private:
     void copy_from(const Sketch &in);
     primitive_index_t append_primitive(std::unique_ptr<primitive_t> primitive);
     constraint_index_t append_constraint(std::unique_ptr<constraint_t> constraint);
-    void enforce_pinned_vertices();
     void refresh_all_derived_geometry();
     bool refresh_primitive_geometry(primitive_index_t idx, const std::set<vertex_index_t> &pinned_vertices);
     bool primitive_index_valid(primitive_index_t idx) const;
