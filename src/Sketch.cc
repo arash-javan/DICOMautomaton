@@ -1713,6 +1713,9 @@ Sketch::save_to_file(const std::filesystem::path &path, std::string *error_messa
             store_error(error_message, "Unable to open file for writing");
             return false;
         }
+        const auto defaultprecision = fout.precision();
+        fout.precision(std::numeric_limits<double>::max_digits10 + 1);
+
         fout << "sketch_format_version 1\n";
 
         const auto &p = plane();
@@ -1769,6 +1772,7 @@ Sketch::save_to_file(const std::filesystem::path &path, std::string *error_messa
             }
         }
 
+        fout.precision(defaultprecision);
         fout.close();
         return true;
     }catch(const std::exception &e){
