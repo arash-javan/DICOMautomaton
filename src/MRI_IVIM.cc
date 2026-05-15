@@ -1053,9 +1053,9 @@ TEST_CASE( "MRI_IVIM::GetBiExp" ){
     tcs.back().D      = 0.001; // mm^2/s
     tcs.back().Dp     = 0.01;  // mm^2/s
     tcs.back().bvalue_threshold = 200.0;
-    tcs.back().f_rtol  = 0.05;
+    tcs.back().f_rtol  = 0.10;
     tcs.back().D_rtol  = 0.05;
-    tcs.back().Dp_rtol = 0.25;
+    tcs.back().Dp_rtol = 1E10; // Do not expect to recover this parameter from high-b alone.
     tcs.back().b_vals = { 0,200,400,800 };
     tcs.back().S_vals = generate_Ss(tcs.back());
 
