@@ -2950,7 +2950,7 @@ namespace detail {
 #define REGISTER_EXCEPTION_TRANSLATOR(signature) DOCTEST_REGISTER_EXCEPTION_TRANSLATOR(signature)
 #define REGISTER_REPORTER(name, priority, reporter) DOCTEST_REGISTER_REPORTER(name, priority, reporter)
 #define REGISTER_LISTENER(name, priority, reporter) DOCTEST_REGISTER_LISTENER(name, priority, reporter)
-#define INFO(...) DOCTEST_INFO(__VA_ARGS__)
+//#define INFO(...) DOCTEST_INFO(__VA_ARGS__)
 #define CAPTURE(x) DOCTEST_CAPTURE(x)
 #define ADD_MESSAGE_AT(file, line, ...) DOCTEST_ADD_MESSAGE_AT(file, line, __VA_ARGS__)
 #define ADD_FAIL_CHECK_AT(file, line, ...) DOCTEST_ADD_FAIL_CHECK_AT(file, line, __VA_ARGS__)
@@ -2960,7 +2960,7 @@ namespace detail {
 #define FAIL(...) DOCTEST_FAIL(__VA_ARGS__)
 #define TO_LVALUE(...) DOCTEST_TO_LVALUE(__VA_ARGS__)
 
-#define WARN(...) DOCTEST_WARN(__VA_ARGS__)
+//#define WARN(...) DOCTEST_WARN(__VA_ARGS__)
 #define WARN_FALSE(...) DOCTEST_WARN_FALSE(__VA_ARGS__)
 #define WARN_THROWS(...) DOCTEST_WARN_THROWS(__VA_ARGS__)
 #define WARN_THROWS_AS(expr, ...) DOCTEST_WARN_THROWS_AS(expr, __VA_ARGS__)
