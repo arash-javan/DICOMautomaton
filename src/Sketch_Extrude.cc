@@ -19,6 +19,7 @@
 
 #include "YgorLog.h"
 #include "YgorMathConstrainedDelaunay.h"
+#include "YgorMathMonotoneDecomposition.h"
 
 namespace {
 
@@ -606,7 +607,23 @@ static void append_extruded_end_caps(const Sketch &sketch,
 
     YLOGDEBUG("Sending " << cap_vertices_2d.size() << " vertices and " << cap_edges_2d.size() 
                          << " edge constraints for constrained Delaunay triangulation");
-    const auto planar_caps = Constrained_Delaunay_Triangulation_2<double, uint64_t>(cap_vertices_2d, cap_edges_2d);
+    fv_surface_mesh<double, uint64_t> planar_caps;
+    try{
+        planar_caps = Constrained_Delaunay_Triangulation_2<double, uint64_t>(cap_vertices_2d, cap_edges_2d);
+    }catch(const std::exception &e){
+        planar_caps.faces.clear();
+        YLOGWARN("Delaunay triangulation failed: " << e.what());
+    }
+    if(planar_caps.faces.empty()){
+        try{
+            YLOGWARN("Attempting fallback triangulation via monotone decomposition");
+            const auto monotone_pieces = Monotone_Decomposition_2<double, uint64_t>(raw_closed_loops);
+            planar_caps = Triangulate_Monotone_Decomposition<double, uint64_t>(raw_closed_loops, monotone_pieces, false);
+        }catch(const std::exception &e){
+            planar_caps.faces.clear();
+            YLOGWARN("Triangulation via monotone decomposition failed: " << e.what());
+        }
+    }
     if(planar_caps.faces.empty()) return;
 
     const auto normal = sketch.plane().normal();
