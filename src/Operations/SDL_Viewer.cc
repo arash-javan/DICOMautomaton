@@ -1339,6 +1339,17 @@ bool SDL_Viewer(Drover &DICOM_data,
     };
     std::optional<image_mouse_pos_s> image_mouse_pos_opt;
 
+    struct sketch_mouse_pos_s {
+        bool mouse_hovering_canvas = false;
+        bool sketch_window_focused = false;
+        bool sketch_window_hovered = false;
+        Sketch::projection_t plane_pos = {};
+        vec3<double> dicom_pos;
+        float pixel_scale = 1.0f;
+        std::function<ImVec2(const vec3<double>&)> DICOM_to_pixels;
+    };
+//    std::optional<sketch_mouse_pos_s> sketch_mouse_pos_opt;
+
     samples_1D<double> row_profile;
     samples_1D<double> col_profile;
     samples_1D<double> time_profile;
@@ -1793,6 +1804,34 @@ bool SDL_Viewer(Drover &DICOM_data,
         }
     };
     sketch_numeric_constraint_popup_t sketch_numeric_constraint_popup;
+    struct sketch_canvas_view_t {
+        Sketch::projection_t centre = {};
+        double zoom = 1.0;
+        bool framing_initialized = false;
+    } sketch_canvas_view;
+    struct sketch_image_geometry_state_t {
+        Sketch::plane_frame_t plane;
+        Sketch::bounding_box_t bounds;
+        std::vector<vec3<double>> boundary;
+    };
+    std::optional<sketch_image_geometry_state_t> sketch_image_geometry;
+    bool sketch_add_image_boundary_on_plane_adopt = false;
+    struct sketch_mesh_face_adoption_t {
+        bool active = false;
+        bool include_face_geometry = false;
+        bool include_coplanar_geometry = false;
+        double coplanar_eps = 1.0;
+        std::optional<Sketch::plane_frame_t> hovered_plane;
+        std::vector<vec3<double>> hovered_face_vertices;
+        std::vector<std::vector<vec3<double>>> hovered_coplanar_faces;
+        std::array<ImVec2, 4> hovered_rectangle = {};
+        bool hovered_rectangle_visible = false;
+    } sketch_mesh_face_adoption;
+    struct sketch_plane_adoption_payload_t {
+        Sketch::plane_frame_t plane;
+        std::vector<std::vector<vec3<double>>> support_loops;
+    };
+    std::optional<sketch_plane_adoption_payload_t> pending_sketch_plane_adoption;
     const auto make_default_sketch_solve_options = []() -> Sketch::solve_options_t {
         Sketch::solve_options_t out;
         out.relative_tolerance = 1.0E-5;
@@ -1937,13 +1976,19 @@ bool SDL_Viewer(Drover &DICOM_data,
         sketch_log_scroll_to_bottom = true;
     };
 
+    const auto default_sketch_plane = []() -> Sketch::plane_frame_t {
+        Sketch::plane_frame_t frame;
+        frame.origin = vec3<double>(0.0, 0.0, 0.0);
+        frame.row_unit = vec3<double>(1.0, 0.0, 0.0);
+        frame.col_unit = vec3<double>(0.0, 1.0, 0.0);
+        return frame;
+    };
+
     const auto try_get_current_sketch_plane = [&](disp_img_it_t l_img_it) -> std::optional<Sketch::plane_frame_t> {
         if(l_img_it == disp_img_it_t()) return {};
-        Sketch::plane_frame_t frame;
-        frame.origin = l_img_it->position(0L, 0L);
-        frame.row_unit = l_img_it->row_unit.unit();
-        frame.col_unit = l_img_it->col_unit.unit();
-        return frame;
+        // Preserve the image row direction as the in-plane hint so adopted sketch frames remain aligned with the
+        // display image orientation instead of an arbitrary orthonormal basis.
+        return Sketch::plane_frame_t::from_plane(l_img_it->image_plane(), l_img_it->row_unit);
     };
 
     const auto sketch_is_compatible_with_image = [&](const Sketch &sketch,
@@ -1961,12 +2006,14 @@ bool SDL_Viewer(Drover &DICOM_data,
 
     const auto ensure_sketch_plane = [&](Sketch &sketch,
                                          disp_img_it_t l_img_it) -> bool {
-        const auto l_frame_opt = try_get_current_sketch_plane(l_img_it);
-        if(!l_frame_opt) return false;
         if(!sketch.has_plane()){
-            sketch.set_plane(l_frame_opt.value());
+            // Sketches now default to a generic plane so they can be edited without requiring a currently displayed image.
+            // The intended workflow is to sketch freely on that default plane and later adopt an image or mesh plane once a
+            // more specific embedding is known.
+            sketch.set_plane(default_sketch_plane());
             return true;
         }
+        if(l_img_it == disp_img_it_t()) return true;
         return sketch_is_compatible_with_image(sketch, l_img_it);
     };
     const auto try_get_current_sketch_bounds = [&](disp_img_it_t l_img_it) -> std::optional<Sketch::bounding_box_t> {
@@ -2037,9 +2084,7 @@ bool SDL_Viewer(Drover &DICOM_data,
         slot.history.snapshot();
         slot.history.trim(32U);
         auto &sketch = slot.history.current();
-        if(!ensure_sketch_plane(sketch, l_img_it)){
-            YLOGWARN("Current sketch belongs to a different image plane; use another sketch slot or reset the sketch");
-        }
+        ensure_sketch_plane(sketch, l_img_it);
         return sketch;
     };
     const auto solve_sketch_after_edit = [&](Sketch &editable_sketch,
@@ -2053,6 +2098,7 @@ bool SDL_Viewer(Drover &DICOM_data,
             }
             sketch_last_unresolved_constraints = {};
         }
+        sketch_canvas_view.framing_initialized = false;
         append_sketch_summary_log(editable_sketch);
     };
     const auto apply_sketch_edit = [&](disp_img_it_t l_img_it, auto &&fn) -> Sketch& {
@@ -2060,6 +2106,22 @@ bool SDL_Viewer(Drover &DICOM_data,
         fn(editable_sketch);
         solve_sketch_after_edit(editable_sketch, l_img_it);
         return editable_sketch;
+    };
+    const auto adopt_sketch_plane = [&](const Sketch::plane_frame_t &plane_frame,
+                                        const std::vector<std::vector<vec3<double>>> &support_loops,
+                                        disp_img_it_t l_img_it,
+                                        const std::string &label) -> void {
+        auto &editable_sketch = create_sketch_snapshot(l_img_it);
+        editable_sketch.set_plane(plane_frame);
+        for(const auto &loop : support_loops){
+            editable_sketch.add_projected_support_polyline(loop, true);
+        }
+        solve_sketch_after_edit(editable_sketch, l_img_it);
+        clear_sketch_interaction_state();
+        current_sketch_slot().selection.clear();
+        current_sketch_slot().clear_vertex_selection();
+        sketch_canvas_view.framing_initialized = false;
+        append_sketch_log(label);
     };
 
     const auto sketch_tag_colour = [](Sketch::geometry_tag_t tag) -> ImColor {
@@ -4240,7 +4302,7 @@ bool SDL_Viewer(Drover &DICOM_data,
                         tagged_pos = {};
                         clear_sketch_interaction_state();
                     }
-                    if(ImGui::MenuItem("Vector Sketching", nullptr, &view_toggles.view_vector_sketching_enabled)){
+                    if(ImGui::MenuItem("Vector Sketchpad", nullptr, &view_toggles.view_vector_sketching_enabled)){
                         view_toggles.view_contouring_enabled = false;
                         view_toggles.view_drawing_enabled = false;
                         //view_toggles.view_vector_sketching_enabled = false;
@@ -5782,63 +5844,17 @@ bool SDL_Viewer(Drover &DICOM_data,
 
                                            &frame_count,
 
-                                           &sketch_slots,
-                                           &current_sketch_slot,
-                                           &reset_sketch_slot,
-                                           &try_get_current_sketch_plane,
-                                           &sketch_is_compatible_with_image,
-                                           &sketch_selection_tolerance,
-                                           &sketch_snap_direction,
-                                           &sketch_constraint_indicator,
-                                           &sketch_tag_colour,
-                                           &sketch_hovered_primitive,
-                                           &sketch_hovered_vertex,
-                                           &sketch_hovered_constraint,
-                                           &sketch_editor_hovered_primitive,
-                                           &sketch_editor_hovered_vertex,
-                                           &sketch_editor_hovered_constraint,
-                                           &sketch_pending_primitive,
-                                           &sketch_tool_mode,
-                                           &sketch_drag_state,
-                                           &sketch_slot_num,
-                                           &ensure_sketch_slots,
-                                           &clear_sketch_interaction_state,
-                                           &sketch_last_unresolved_constraints,
-                                           &sketch_show_vertex_numbers,
-                                           &sketch_show_primitive_numbers,
-                                           &sketch_show_constraint_numbers,
-                                           &sketch_solve_options,
-                                           &sketch_solve_on_edit,
-                                           &sketch_constrain_to_image_frame,
-                                           &sketch_snap_distance,
-                                           &sketch_extrude_into_frame,
-                                           &sketch_extrude_out_of_frame,
-                                           &sketch_extrude_into_frame_angle,
-                                           &sketch_extrude_out_of_frame_angle,
-                                           &sketch_export_extrusion_caps,
-                                           &sketch_numeric_constraint_popup,
-                                           &view_sketch_editor_enabled,
-                                           &sketch_save_path,
-                                           &sketch_load_path,
-                                           &sketch_file_status,
-                                           &sketch_log_entries,
-                                           &sketch_log_scroll_to_bottom,
-                                           &create_sketch_snapshot,
-                                           &append_sketch_log,
-                                           &append_sketch_summary_log,
-                                           &configured_sketch_solve_options,
-                                           &solve_sketch_after_edit,
-                                           &apply_sketch_edit,
-                                           &sketch_fillet_radius,
-                                           &sketch_extrude_max_discretization_error,
-
                                            &img_channel,
-                                           &img_features ]() -> void {
+                                           &img_features,
+
+                                           &sketch_image_geometry ]() -> void {
 
 // Lock the image details mutex in shared mode.
 // 
 // ... TODO ...
 //
+            sketch_image_geometry = {};
+
             if( !view_toggles.view_images_enabled
             ||  !current_texture.texture_exists
             ||  need_to_reload_opengl_texture.load() ) return;
@@ -5900,6 +5916,21 @@ bool SDL_Viewer(Drover &DICOM_data,
             //const auto img_top_right = img_top_left + disp_img_it->row_unit * img_dicom_width;
             //const auto img_bottom_left = img_top_left + disp_img_it->col_unit * img_dicom_height;
             const auto img_plane = disp_img_it->image_plane();
+            {
+                sketch_image_geometry_state_t l_sketch_image_geometry;
+                l_sketch_image_geometry.plane = Sketch::plane_frame_t::from_plane(img_plane, disp_img_it->row_unit);
+                l_sketch_image_geometry.bounds.min.u = -0.5 * disp_img_it->pxl_dx;
+                l_sketch_image_geometry.bounds.min.v = -0.5 * disp_img_it->pxl_dy;
+                l_sketch_image_geometry.bounds.max.u = (static_cast<double>(disp_img_it->columns) - 0.5) * disp_img_it->pxl_dx;
+                l_sketch_image_geometry.bounds.max.v = (static_cast<double>(disp_img_it->rows) - 0.5) * disp_img_it->pxl_dy;
+                l_sketch_image_geometry.boundary = {
+                    disp_img_it->position(0L, 0L),
+                    disp_img_it->position(0L, disp_img_it->columns - 1L),
+                    disp_img_it->position(disp_img_it->rows - 1L, disp_img_it->columns - 1L),
+                    disp_img_it->position(disp_img_it->rows - 1L, 0L),
+                };
+                sketch_image_geometry = l_sketch_image_geometry;
+            }
 
             // Continue now that we have an exclusive lock.
             ImGui::Begin("Images", &view_toggles.view_images_enabled);
@@ -6183,407 +6214,1845 @@ bool SDL_Viewer(Drover &DICOM_data,
                 }
             }
 
-            if( view_toggles.view_vector_sketching_enabled
-            &&  image_mouse_pos.DICOM_to_pixels ){
-                auto &slot = current_sketch_slot();
-                auto &sketch = slot.history.current();
-                const bool sketch_compatible = sketch_is_compatible_with_image(sketch, disp_img_it);
+            // Contouring and drawing interface.
+            if( view_toggles.view_contouring_enabled
+            ||  view_toggles.view_drawing_enabled ){
+                // Provide a visual cue for the contouring brush.
+                if(image_mouse_pos.mouse_hovering_image){
+                    const auto pixel_radius = static_cast<float>(contouring_reach) * image_mouse_pos.pixel_scale;
+                    const auto c = ImColor(0.0f, 1.0f, 0.8f, 1.0f);
 
-                if( image_mouse_pos.mouse_hovering_image
-                &&  sketch_compatible ){
-                    const auto tol = sketch_selection_tolerance(image_mouse_pos, disp_img_it->pxl_dx, disp_img_it->pxl_dy);
-                    if(const auto hovered_vertex = sketch.nearest_primitive_vertex(image_mouse_pos.dicom_pos, tol); hovered_vertex){
-                        sketch_hovered_primitive = hovered_vertex->first;
-                        sketch_hovered_vertex = hovered_vertex->second;
-                    }else{
-                        sketch_hovered_primitive = sketch.nearest_primitive(image_mouse_pos.dicom_pos, tol);
-                        sketch_hovered_vertex = {};
+                    if( (contouring_brush == brush_t::rigid_circle)
+                    ||  (contouring_brush == brush_t::rigid_sphere)
+                    ||  (contouring_brush == brush_t::gaussian_2D)
+                    ||  (contouring_brush == brush_t::tanh_2D)
+                    ||  (contouring_brush == brush_t::gaussian_3D)
+                    ||  (contouring_brush == brush_t::tanh_3D)
+                    ||  (contouring_brush == brush_t::median_circle)
+                    ||  (contouring_brush == brush_t::mean_circle)
+                    ||  (contouring_brush == brush_t::median_sphere)
+                    ||  (contouring_brush == brush_t::mean_sphere) ){
+                        imgs_window_draw_list->AddCircle(io.MousePos, pixel_radius, c);
+
+                    }else if( (contouring_brush == brush_t::rigid_square)
+                          ||  (contouring_brush == brush_t::median_square)
+                          ||  (contouring_brush == brush_t::mean_square)
+                          ||  (contouring_brush == brush_t::rigid_cube)
+                          ||  (contouring_brush == brush_t::median_cube)
+                          ||  (contouring_brush == brush_t::mean_cube) ){
+                        ImVec2 ul( io.MousePos.x - pixel_radius,
+                                   io.MousePos.y - pixel_radius );
+                        ImVec2 lr( io.MousePos.x + pixel_radius,
+                                   io.MousePos.y + pixel_radius );
+                        imgs_window_draw_list->AddRect(ul, lr, c);
                     }
-                    sketch_hovered_constraint = {};
-                }else if(!sketch_drag_state.selection_box_active){
-                    sketch_hovered_primitive = {};
-                    sketch_hovered_vertex = {};
-                    sketch_hovered_constraint = {};
                 }
 
-                if(sketch_compatible){
-                    const auto effective_hovered_primitive = sketch_hovered_primitive ? sketch_hovered_primitive
-                                                                                      : sketch_editor_hovered_primitive;
-                    const auto effective_hovered_vertex = sketch_hovered_vertex ? sketch_hovered_vertex
-                                                                                : sketch_editor_hovered_vertex;
-                    const auto effective_hovered_constraint = sketch_hovered_constraint ? sketch_hovered_constraint
-                                                                                        : sketch_editor_hovered_constraint;
-                    const auto fully_constrained_vertices = sketch.fully_constrained_vertices();
-                    std::set<Sketch::primitive_index_t> fully_constrained_primitives;
-                    auto constraint_highlight_vertices = std::set<Sketch::vertex_index_t>{};
-                    auto constraint_highlight_primitives = std::set<Sketch::primitive_index_t>{};
-                    if(effective_hovered_constraint){
-                        if(const auto *hovered_constraint = sketch.constraint(effective_hovered_constraint.value()); hovered_constraint != nullptr){
-                            const auto referenced_primitives = hovered_constraint->referenced_primitives();
-                            constraint_highlight_primitives.insert(std::begin(referenced_primitives), std::end(referenced_primitives));
-                            const auto referenced_vertices = hovered_constraint->referenced_vertices();
-                            constraint_highlight_vertices.insert(std::begin(referenced_vertices), std::end(referenced_vertices));
-                            for(const auto primitive_idx : referenced_primitives){
-                                if(const auto *referenced_primitive = sketch.primitive(primitive_idx); referenced_primitive != nullptr){
-                                    const auto primitive_vertices = referenced_primitive->referenced_vertices();
-                                    constraint_highlight_vertices.insert(std::begin(primitive_vertices), std::end(primitive_vertices));
+                ImGui::SetNextWindowSize(ImVec2(510, 650), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowPos(ImVec2(680, 400), ImGuiCond_FirstUseEver);
+                //ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
+                if(view_toggles.view_drawing_enabled){
+                    ImGui::Begin("Drawing", &view_toggles.view_drawing_enabled, ImGuiWindowFlags_AlwaysAutoResize);
+                    ImGui::Text("Note: this functionality is still under active development.");
+
+                }else if(view_toggles.view_contouring_enabled){
+                    ImGui::Begin("Contouring", &view_toggles.view_contouring_enabled, ImGuiWindowFlags_AlwaysAutoResize);
+                    ImGui::Text("Note: this functionality is still under active development.");
+                    if(ImGui::Button("Save")){ 
+                        ImGui::OpenPopup("Save Contours");
+                        contour_extraction_underway += 1;
+
+                        // Launch a thread to extract contours.
+                        const auto worker = [&extract_contours,
+                                             &extracted_contours_mutex,
+                                             &extracted_contours,
+                                             &contour_extraction_underway,
+                                             l_cdrover = cdrover_ptr->Deep_Copy(),
+                                             contouring_method ](){
+                            try{
+                                YLOGINFO("Starting contour extraction");
+                                auto out = extract_contours(l_cdrover, contouring_method);
+                                YLOGINFO("Completed contour extraction; waiting on lock");
+
+                                std::unique_lock<std::shared_timed_mutex> ec_lock(extracted_contours_mutex);
+                                extracted_contours = out;
+                            }catch(const std::exception &e){
+                                YLOGWARN("Contour extraction failed: '" << e.what() << "'");
+
+                                std::unique_lock<std::shared_timed_mutex> ec_lock(extracted_contours_mutex);
+                                extracted_contours = {};
+                            }
+
+                            contour_extraction_underway -= 1;
+                            return;
+                        };
+                        wq.submit_task( worker ); // Offload to waiting worker thread.
+                    }
+                    ImGui::SameLine();
+                    if(ImGui::BeginPopupModal("Save Contours", NULL, ImGuiWindowFlags_AlwaysAutoResize)){
+                        const std::string dots((frame_count / 15) % 4, '.'); // Simplistic animation.
+                        ImGui::Text("Saving contours%s", dots.c_str());
+
+                        ImGui::InputText("ROI Name", new_contour_name.data(), new_contour_name.size());
+                        std::string entered_text;
+                        array_to_string(entered_text, new_contour_name);
+
+                        ImGui::Checkbox("Overwrite existing contours", &overwrite_existing_contours);
+
+                        // Check if the contouring task is complete. We assume that the work is done and the results
+                        // have replaced the original contouring Drover object if there are no available contours.
+                        const bool work_is_done = (contour_extraction_underway.load() == 0L);
+                        if(work_is_done){
+                            std::unique_lock<std::shared_timed_mutex> lock(extracted_contours_mutex,
+                                                                           std::chrono::microseconds(50));
+                            if( lock
+                            && extracted_contours){
+                                *cdrover_ptr = extracted_contours.value();
+                                extracted_contours = {};
+                            }
+                        }else{
+                            ImGui::TextDisabled("Waiting for contour extraction%s", dots.c_str());
+                        }
+
+                        bool roiname_is_valid = !entered_text.empty();
+                        if(!roiname_is_valid){
+                            ImGui::TextDisabled("Please enter a name to proceed.");
+                        }
+                        if(roiname_is_valid && !overwrite_existing_contours){
+                            DICOM_data.Ensure_Contour_Data_Allocated();
+                            roiname_is_valid = ( std::find_if( std::begin(DICOM_data.contour_data->ccs),
+                                                         std::end(DICOM_data.contour_data->ccs),
+                                                         [entered_text](const contour_collection<double> &cc) -> bool {
+                                                             const auto l_roi_name = cc.get_dominant_value_for_key("ROIName").value_or("unspecified");
+                                                             return (l_roi_name == entered_text);
+                                                         }) == std::end(DICOM_data.contour_data->ccs) );
+                            if(!roiname_is_valid){
+                                ImGui::TextDisabled("Found existing contour with the given name.");
+                            }
+                        }
+
+                        const bool save_possible = roiname_is_valid && work_is_done;
+                        ImGui::BeginDisabled(!save_possible);
+                        const bool clicked_save = ImGui::Button("Save");
+                        ImGui::EndDisabled();
+
+                        if( clicked_save
+                        &&  save_possible
+                        &&  save_contour_buffer(entered_text) ){
+                            string_to_array(new_contour_name, "");
+                            ImGui::CloseCurrentPopup();
+                        }
+
+                        ImGui::SameLine();
+                        if(ImGui::Button("Cancel")){
+                            ImGui::CloseCurrentPopup();
+                            // Detaching here would be nice, but not currently available for std::shared_future AFAICT.
+                            // Otherwise, we have to wait for the task to complete. Maybe transfer to yet another thread
+                            // and detach the thread?? TODO.
+                            extracted_contours = decltype(extracted_contours)();
+                            contouring_img_altered = true;
+                        }
+                        ImGui::EndPopup();
+                    }
+
+                    DICOM_data.Ensure_Contour_Data_Allocated();
+                    if( ImGui::Button("Edit Existing")
+                    &&  !DICOM_data.contour_data->ccs.empty() ){ 
+                        edit_existing_contour_selection = std::begin(DICOM_data.contour_data->ccs);
+
+                        ImGui::OpenPopup("Edit Existing Contours");
+                    }
+                    if(ImGui::BeginPopupModal("Edit Existing Contours", NULL, ImGuiWindowFlags_AlwaysAutoResize)){
+                        DICOM_data.Ensure_Contour_Data_Allocated();
+
+                        const auto beg = std::begin(DICOM_data.contour_data->ccs);
+                        const auto end = std::end(DICOM_data.contour_data->ccs);
+                        bool valid_roi_selected = false;
+                        
+                        if(ImGui::BeginListBox("Contours")){
+                            for(auto it = beg; it != end; ++it){
+                                const auto l_roi_name = it->get_dominant_value_for_key("ROIName").value_or("unspecified");
+                                const bool is_selected =  edit_existing_contour_selection
+                                                       && (edit_existing_contour_selection.value() == it);
+                                if(is_selected) valid_roi_selected = true;
+                                ImGui::PushID(static_cast<void*>(std::addressof(*it)));
+                                if(ImGui::Selectable(l_roi_name.data(), is_selected)){
+                                    edit_existing_contour_selection = it;
                                 }
+                                ImGui::PopID();
+                                if(is_selected) ImGui::SetItemDefaultFocus(); // Used for keyboard navigation.
+                            }
+                            ImGui::EndListBox();
+                        }
+
+                        if(ImGui::BeginListBox("Overlap Handling")){
+                            for(size_t i = 0UL; i < contour_overlap_styles.size(); ++i){
+                                const bool is_selected = (i == contour_overlap_style);
+                                ImGui::PushID(i);
+                                if(ImGui::Selectable(contour_overlap_styles[i].data(), is_selected)){
+                                    contour_overlap_style = i;
+                                }
+                                ImGui::PopID();
+                                if(is_selected) ImGui::SetItemDefaultFocus(); // Used for keyboard navigation.
+                            }
+                            ImGui::EndListBox();
+                        }
+
+                        const bool clicked_copy = ImGui::Button("Copy");
+                        if( clicked_copy
+                        &&  valid_roi_selected
+                        &&  edit_existing_contour_selection ){
+
+                            // Copy the selected contours to a shuttle. We use double-buffering here in case there are
+                            // any existing contours.
+                            decltype(cdrover_ptr->contour_data->ccs) shtl;
+                            shtl.emplace_back();
+                            for(const auto& c : edit_existing_contour_selection.value()->contours){
+                                shtl.back().contours.push_back( c );
+                            }
+                            auto cm = shtl.back().get_common_metadata({}, {});
+
+                            // Make snapshot of the current state.
+                            cdrover_ptr = create_cdrover_snapshot(contouring_drover_cache, cdrover_ptr);
+
+                            std::list<OperationArgPkg> Operations;
+                            const bool op_load_res = Load_Standard_Script( Operations, "plumbing", "copy existing contours" );
+                            if(!op_load_res) throw std::runtime_error("Unable to load script");
+                            metadata_map_t l_InvocationMetadata;
+                            if(contour_overlap_styles.empty()) throw std::runtime_error("No contour overlap styles available");
+                            contour_overlap_style = std::clamp<size_t>(contour_overlap_style,
+                                                                       static_cast<size_t>(0UL),
+                                                                       contour_overlap_styles.size() - static_cast<size_t>(1UL));
+                            l_InvocationMetadata["contour_overlap_method"] = contour_overlap_styles[contour_overlap_style];
+
+                            cdrover_ptr->Ensure_Contour_Data_Allocated();
+                            cdrover_ptr->contour_data->ccs.swap(shtl);
+                            const bool res = Operation_Dispatcher(*cdrover_ptr, l_InvocationMetadata, FilenameLex, Operations);
+                            cdrover_ptr->Ensure_Contour_Data_Allocated();
+                            cdrover_ptr->contour_data->ccs.swap(shtl);
+                            
+                            contouring_img_altered = true;
+                            if(res){
+                                edit_existing_contour_selection = {};
+                                ImGui::CloseCurrentPopup();
+                            }else{
+                                YLOGWARN("Copying failed");
+                            }
+                        }
+
+                        ImGui::SameLine();
+                        if(ImGui::Button("Cancel")){
+                            ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::EndPopup();
+                    }
+                }
+
+                // Undo and redo manual control.
+                if( view_toggles.view_contouring_enabled ){
+                    const auto v_list = contouring_drover_cache.get_versions();
+                    const auto v_curr = contouring_drover_cache.get_version(cdrover_ptr);
+                    int pos = 0;
+                    for(const auto &v : v_list){
+                        if(v == v_curr){
+                            break;
+                        }else{
+                            ++pos;
+                        }
+                    }
+
+                    const auto N_versions = static_cast<int>(v_list.size());
+                    ImGui::SliderInt("History", &pos, 0, N_versions - 1);
+                    if( ImGui::IsItemHovered() ){
+                        ImGui::BeginTooltip();
+                        ImGui::Text("Note: hot keys [ctrl]+[z] and [ctrl]+[y] are supported.");
+                        ImGui::EndTooltip();
+                    }
+                    const auto new_pos = std::clamp<int>(pos, 0, N_versions - 1);
+                    const auto v_new = *(std::next( std::begin(v_list), new_pos ));
+                    if(v_new != v_curr){
+                        auto l_cdrover_ptr = contouring_drover_cache.get(v_new);
+                        cdrover_ptr = (l_cdrover_ptr == nullptr) ? cdrover_ptr : l_cdrover_ptr;
+
+                        contouring_img_altered = true;
+                    }
+
+                    if(ImGui::Checkbox("Show contours from adjacent slices", &contouring_show_adjacent)){
+                        contouring_img_altered = true;
+                    }
+
+                    ImGui::Separator();
+                }
+
+                ImGui::Text("Brush");
+                ImGui::DragFloat("Radius (mm)", &contouring_reach, 0.1f, 0.5f, 50.0f);
+                if(view_toggles.view_drawing_enabled){
+                    ImGui::DragFloat("Intensity", &contouring_intensity, 0.1f, -1000.0f, 1000.0f);
+                }else if(view_toggles.view_contouring_enabled){
+                    contouring_intensity = 1.0f;
+                }
+
+                ImGui::Text("2D shapes");
+                if(ImGui::Button("Rigid Circle")){
+                    contouring_brush = brush_t::rigid_circle;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A fast brush that is not smoothed.\n"
+                                "Produces jagged brush strokes and contours.\n"
+                                "This brush has no dynamics.");
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Mean Circle")){
+                    contouring_brush = brush_t::mean_circle;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A brush that averages voxel intensities.");
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Median Circle")){
+                    contouring_brush = brush_t::median_circle;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A brush that applies a median filter to voxel intensities.");
+                    ImGui::EndTooltip();
+                }
+
+                if(ImGui::Button("Rigid Square")){
+                    contouring_brush = brush_t::rigid_square;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A fast brush that is not smoothed.\n"
+                                "Produces jagged brush strokes and contours.\n"
+                                "This brush has no dynamics.");
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Mean Square")){
+                    contouring_brush = brush_t::mean_square;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A brush that averages voxel intensities.");
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Median Square")){
+                    contouring_brush = brush_t::median_square;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A brush that applies a median filter to voxel intensities.");
+                    ImGui::EndTooltip();
+                }
+
+                if(ImGui::Button("2D Gaussian")){
+                    contouring_brush = brush_t::gaussian_2D;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Provides a smooth brush with strong dynamic effect.\n"
+                                "This brush is somewhat slow because the Gaussian distribution extends\n"
+                                "relatively far outwards into adjacent voxels.");
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("2D Tanh")){
+                    contouring_brush = brush_t::tanh_2D;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Provides geometrically-accurate contours and sweeps with minimal dynamics.\n"
+                                "This brush is also economical compared to the rigid brush,\n"
+                                "requiring lower mask resolution to achieve a smooth contour.");
+                    ImGui::EndTooltip();
+                }
+
+                ImGui::Text("3D shapes");
+                if(ImGui::Button("Rigid Sphere")){
+                    contouring_brush = brush_t::rigid_sphere;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A fast brush that is not smoothed.\n"
+                                "Produces jagged brush strokes and contours.\n"
+                                "This brush has no dynamics.");
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Mean Sphere")){
+                    contouring_brush = brush_t::mean_sphere;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A brush that averages voxel intensities.");
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Median Sphere")){
+                    contouring_brush = brush_t::median_sphere;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A brush that applies a median filter to voxel intensities.");
+                    ImGui::EndTooltip();
+                }
+
+                if(ImGui::Button("Rigid Cube")){
+                    contouring_brush = brush_t::rigid_cube;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A fast brush that is not smoothed.\n"
+                                "Produces jagged brush strokes and contours.\n"
+                                "This brush has no dynamics.");
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Mean Cube")){
+                    contouring_brush = brush_t::mean_cube;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A brush that averages voxel intensities.");
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Median Cube")){
+                    contouring_brush = brush_t::median_cube;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("A brush that applies a median filter to voxel intensities.");
+                    ImGui::EndTooltip();
+                }
+
+                if(ImGui::Button("3D Gaussian")){
+                    contouring_brush = brush_t::gaussian_3D;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Provides a smooth brush with strong dynamic effect.\n"
+                                "This brush is somewhat slow because the Gaussian distribution extends\n"
+                                "relatively far outwards into adjacent voxels.");
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("3D Tanh")){
+                    contouring_brush = brush_t::tanh_3D;
+                }
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Provides geometrically-accurate contours and sweeps with minimal dynamics.\n"
+                                "This brush is also economical compared to the rigid brush,\n"
+                                "requiring lower mask resolution to achieve a smooth contour.");
+                    ImGui::EndTooltip();
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Dilation and Erosion");
+                ImGui::DragFloat("Margin (mm)", &contouring_margin, 0.1f, -10.0f, 10.0f);
+                if(ImGui::Button("Apply Margin")){
+
+                    // Make snapshot of the current state.
+                    if( view_toggles.view_contouring_enabled ){
+                        cdrover_ptr = create_cdrover_snapshot(contouring_drover_cache, cdrover_ptr);
+                    }
+
+                    std::list<OperationArgPkg> Operations;
+                    const bool op_load_res = Load_Standard_Script( Operations, "plumbing", "dilate erode margin" );
+                    if(!op_load_res) throw std::runtime_error("Unable to load script");
+                    metadata_map_t l_InvocationMetadata;
+                    if(contour_overlap_styles.empty()) throw std::runtime_error("No contour overlap styles available");
+                    contour_overlap_style = std::clamp<size_t>(contour_overlap_style,
+                                                               static_cast<size_t>(0UL),
+                                                               contour_overlap_styles.size() - static_cast<size_t>(1UL));
+                    l_InvocationMetadata["reduction"] = (0.0 <= contouring_margin) ? "dilate" : "erode";
+                    l_InvocationMetadata["max_distance"] = std::to_string( std::abs( contouring_margin ) );
+
+                    Drover *d = (view_toggles.view_contouring_enabled) ? cdrover_ptr.get() : &DICOM_data;
+                    if(!Operation_Dispatcher(*d, l_InvocationMetadata, FilenameLex, Operations)){
+                        YLOGWARN("Dilation/Erosion failed");
+                    }
+
+                    if(view_toggles.view_contouring_enabled){
+                        contouring_img_altered = true;
+                    }else if(view_toggles.view_drawing_enabled){
+                        need_to_reload_opengl_texture.store(true);
+                    }
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Clearing");
+                const bool button_clear_one_slice = ImGui::Button("Clear this slice");
+                ImGui::SameLine();
+                const bool button_clear_all_slices = ImGui::Button("Clear all slices");
+
+                if( button_clear_one_slice
+                ||  button_clear_all_slices ){
+
+                    // Make snapshot of the current state.
+                    if( view_toggles.view_contouring_enabled ){
+                        cdrover_ptr = create_cdrover_snapshot(contouring_drover_cache, cdrover_ptr);
+                    }
+                    Drover *d = (view_toggles.view_contouring_enabled) ? cdrover_ptr.get() : &DICOM_data;
+
+                    auto [img_valid, img_array_ptr_it, img_it] = recompute_image_iters();
+                    if( view_toggles.view_contouring_enabled ){
+                        std::tie(img_valid, img_array_ptr_it, img_it) = recompute_cimage_iters();
+                    }
+                    if( img_valid ){
+                        if(false){
+                        }else if(button_clear_one_slice){
+                            img_it->fill_pixels(0.0f);
+                        }else if(button_clear_all_slices){
+                            for(auto & img : (*img_array_ptr_it)->imagecoll.images){
+                                img.fill_pixels(0.0f);
+                            }
+                        }else{
+                            throw std::logic_error("Unaccounted for button clicked");
+                        }
+                    }
+                    if(d != nullptr ){
+                        d->Ensure_Contour_Data_Allocated();
+                        d->contour_data->ccs.clear();
+                    }
+
+                    if(view_toggles.view_contouring_enabled){
+                        contouring_img_altered = true;
+                        contouring_drover_cache.trim(10UL);
+                    }else if(view_toggles.view_drawing_enabled){
+                        need_to_reload_opengl_texture.store(true);
+                    }
+                    last_mouse_button_0_down = 1E30;
+                    last_mouse_button_1_down = 1E30;
+                    last_mouse_button_pos = {};
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Interpolation");
+                const bool button_interpolation_axially = ImGui::Button("Interpolate Axially");
+                if( ImGui::IsItemHovered() ){
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Interpolate *cleared* slices."
+                                "\n\n"
+                                "Only cleared images will be filled in, and the"
+                                "\n image being viewed must be within the range of cleared images."
+                                "\n\n"
+                                "The cleared images must be bounded by non-cleared images."
+                                "\n\n"
+                                "Note: use *only* if contours/shapes are convex and axially aligned"
+                                "\n (e.g. the ends of a cylinder). Misaligned contours/shapes will"
+                                "\n be improperly interpolated.");
+                    ImGui::EndTooltip();
+                }
+                if(button_interpolation_axially){
+                    // Make snapshot of the current state.
+                    if( view_toggles.view_contouring_enabled ){
+                        cdrover_ptr = create_cdrover_snapshot(contouring_drover_cache, cdrover_ptr);
+                    }
+                    Drover *d = (view_toggles.view_contouring_enabled) ? cdrover_ptr.get() : &DICOM_data;
+
+                    auto [img_valid, img_array_ptr_it, img_it] = recompute_image_iters();
+                    if( view_toggles.view_contouring_enabled ){
+                        std::tie(img_valid, img_array_ptr_it, img_it) = recompute_cimage_iters();
+                    }
+                    if( img_valid ){
+
+                        // Build a spatial index.
+                        {
+                            std::list<planar_image_adjacency<float,double>::img_refw_t> selected_imgs;
+                            for(auto &img : (*img_array_ptr_it)->imagecoll.images){
+                                selected_imgs.push_back( std::ref(img) );
+                            }
+                            if(selected_imgs.empty()){
+                                throw std::invalid_argument("Unable to build spatial index: no images available. Cannot continue");
+                            }
+                            if(!Images_Form_Rectilinear_Grid(selected_imgs)){
+                                throw std::invalid_argument("Unable to build spatial index: images do not form a rectilinear grid. Cannot continue");
+                            }
+                        }
+                        const auto row_unit = (*img_array_ptr_it)->imagecoll.images.front().row_unit.unit();
+                        const auto col_unit = (*img_array_ptr_it)->imagecoll.images.front().col_unit.unit();
+                        const auto img_unit = (*img_array_ptr_it)->imagecoll.images.front().ortho_unit();
+
+                        planar_image_adjacency<float,double> img_adj( {}, { { std::ref((*img_array_ptr_it)->imagecoll) } }, img_unit );
+                        if(img_adj.int_to_img.empty()){
+                            throw std::invalid_argument("Unable to build spatial index: mapping is empty. Cannot continue.");
+                        }
+                        //auto beg = std::begin((*img_array_ptr_it)->imagecoll.images);
+                        //auto end = std::end((*img_array_ptr_it)->imagecoll.images);
+                        auto img_refw = typename planar_image_adjacency<float,double>::img_refw_t( std::ref(*img_it) );
+                        const auto img_N = img_adj.image_to_index(img_refw);
+
+                        // Scan outwards to find bounding image slices that have been altered.
+                        std::optional<int64_t> upper_img_N_opt;
+                        std::optional<int64_t> lower_img_N_opt;
+                        std::set<int64_t> gap_imgs;
+
+                        const auto scan_imgs = [&](int64_t increment,
+                                                   std::set<int64_t> &l_empty_imgs){
+
+                            std::optional<int64_t> first_nonempty_img;
+                            for(int64_t i = 0; ; i += increment){
+                                const auto l_img_N = img_N + i;
+                                const bool l_img_valid = img_adj.index_present(l_img_N);
+                                if( !l_img_valid ) break;
+
+                                const auto& img = img_adj.index_to_image(l_img_N);
+                                const auto mm = img.get().minmax();
+                                if( (mm.first < 0.5) &&  (mm.second < 0.5) ){
+                                    l_empty_imgs.insert(l_img_N);
+                                }else{
+                                    first_nonempty_img = l_img_N;
+                                    break;
+                                }
+                            }
+                            return first_nonempty_img;
+                        };
+                        upper_img_N_opt = scan_imgs( 1, gap_imgs);
+                        lower_img_N_opt = scan_imgs(-1, gap_imgs);
+
+                        if(false){
+                        }else if( !upper_img_N_opt || !lower_img_N_opt ){
+                            YLOGWARN("Unable to interpolate: one or both bounding slices were not found");
+                        }else if( (upper_img_N_opt.value() == lower_img_N_opt.value())
+                              ||  gap_imgs.empty() ){
+                            YLOGWARN("Unable to interpolate: no empty slices were found");
+                        }else{
+                            const auto &upper_img = img_adj.index_to_image( upper_img_N_opt.value() ).get();
+                            const auto &lower_img = img_adj.index_to_image( lower_img_N_opt.value() ).get();
+                            for(const auto& gap_img_N : gap_imgs){
+                                auto& gap_img = img_adj.index_to_image( gap_img_N ).get();
+                                const auto rows = gap_img.rows;
+                                const auto cols = gap_img.columns;
+                                const auto chns = gap_img.channels;
+
+                                for(int64_t l_row = 0L; l_row < rows; ++l_row){
+                                    for(int64_t l_col = 0L; l_col < cols; ++l_col){
+                                        const auto upper_pos = upper_img.position(l_row, l_col);
+                                        const auto lower_pos = lower_img.position(l_row, l_col);
+                                        const auto gap_pos   = gap_img.position(l_row, l_col);
+                                        const auto d_gl  = gap_pos.distance(lower_pos);
+                                        const auto d_gu  = gap_pos.distance(upper_pos);
+                                        const auto d_tot = d_gl + d_gu;
+                                        for(int64_t l_chn = 0L; l_chn < chns; ++l_chn){
+                                            const auto upper_val = upper_img.value(l_row, l_col, l_chn);
+                                            const auto lower_val = lower_img.value(l_row, l_col, l_chn);
+
+                                            const auto x = lower_val + (upper_val - lower_val) * (d_gl / d_tot);
+                                            gap_img.reference(l_row, l_col, l_chn) = x;
+                                        }
+                                    }
+                                }
+                            }
+                            YLOGINFO("Interpolated " << gap_imgs.size() << " images axially");
+                        }
+                    }
+                    if(d != nullptr ){
+                        d->Ensure_Contour_Data_Allocated();
+                        d->contour_data->ccs.clear();
+                    }
+
+                    if(view_toggles.view_contouring_enabled){
+                        contouring_img_altered = true;
+                    }else if(view_toggles.view_drawing_enabled){
+                        need_to_reload_opengl_texture.store(true);
+                    }
+                    last_mouse_button_0_down = 1E30;
+                    last_mouse_button_1_down = 1E30;
+                    last_mouse_button_pos = {};
+                }
+
+                if(view_toggles.view_contouring_enabled){
+                    ImGui::Separator();
+                    ImGui::Text("Contour Extraction");
+                    if(ImGui::DragInt("Resolution", &contouring_img_row_col_count, 0.1f, 5, 1024)){
+                        reset_contouring_state(img_array_ptr_it);
+                        contouring_img_altered = true;
+                    }
+                    if( ImGui::IsItemHovered() ){
+                        ImGui::BeginTooltip();
+                        ImGui::Text("Note: any existing contours will be reset.");
+                        ImGui::EndTooltip();
+                    }
+                    if(ImGui::Button("Marching squares")){
+                        contouring_method = "marching-squares";
+                        contouring_img_altered = true;
+                    }
+                    ImGui::SameLine();
+                    if(ImGui::Button("Binary")){
+                        contouring_method = "binary";
+                        contouring_img_altered = true;
+                    }
+
+                    // Regenerate contours from the mask.
+                    cdrover_ptr->Ensure_Contour_Data_Allocated();
+                    if( auto [cimg_valid, cimg_array_ptr_it, cimg_it] = recompute_cimage_iters();
+                        cimg_valid
+                    &&  contouring_img_altered
+                    &&  (frame_count % 5 == 0) ){ // Terrible stop-gap until I can parallelize contour extraction. TODO
+
+                        // Only bother extracting contours for the current and adjacent images.
+                        const auto beg_it = std::begin((*cimg_array_ptr_it)->imagecoll.images);
+                        const auto end_it = std::end((*cimg_array_ptr_it)->imagecoll.images);
+                        Drover shtl;
+                        shtl.Ensure_Contour_Data_Allocated();
+                        shtl.image_data.push_back(std::make_unique<Image_Array>());
+                        //shtl.image_data.back()->imagecoll.images.emplace_back();
+
+                        if( contouring_show_adjacent
+                        &&  (cimg_it != beg_it) ){
+                            shtl.image_data.back()->imagecoll.images.emplace_back( *(std::prev(cimg_it)) );
+                        }
+                        shtl.image_data.back()->imagecoll.images.emplace_back( *cimg_it );
+                        if( contouring_show_adjacent
+                        &&  (std::next(cimg_it) != end_it) ){
+                            shtl.image_data.back()->imagecoll.images.emplace_back( *(std::next(cimg_it)) );
+                        }
+
+                        std::list<OperationArgPkg> Operations;
+                        const bool op_load_res = Load_Standard_Script( Operations, "plumbing", "extract contours from mask" );
+                        if(!op_load_res) throw std::runtime_error("Unable to load script");
+                        metadata_map_t l_InvocationMetadata;
+                        l_InvocationMetadata["method"] = contouring_method;
+
+                        if(!Operation_Dispatcher(shtl, l_InvocationMetadata, FilenameLex, Operations)){
+                            YLOGWARN("ContourViaThreshold failed");
+                        }
+
+                        cdrover_ptr->contour_data->ccs.clear();
+                        cdrover_ptr->Consume( shtl.contour_data );
+
+                        contouring_img_altered = false;
+                    }
+
+                    // Draw the WIP contours.
+                    cdrover_ptr->Ensure_Contour_Data_Allocated();
+                    if( auto [cimg_valid, cimg_array_ptr_it, cimg_it] = recompute_cimage_iters();
+                        cimg_valid
+                    &&  (cdrover_ptr->Has_Contour_Data()) ){
+                        const auto cimg_dicom_width = cimg_it->pxl_dx * cimg_it->columns;
+                        const auto cimg_dicom_height = cimg_it->pxl_dy * cimg_it->rows; 
+                        //const auto cimg_top_left = cimg_it->anchor + cimg_it->offset
+                        //                         - cimg_it->row_unit * cimg_it->pxl_dx * 0.5f
+                        //                         - cimg_it->col_unit * cimg_it->pxl_dy * 0.5f;
+                        //const auto cimg_top_right = cimg_top_left + cimg_it->row_unit * cimg_dicom_width;
+                        //const auto cimg_bottom_left = cimg_top_left + cimg_it->col_unit * cimg_dicom_height;
+                        //const auto cimg_plane = cimg_it->image_plane();
+
+                        for(const auto &cc : cdrover_ptr->contour_data->ccs){
+                            for(const auto &cop : cc.contours){
+                                if( cop.points.empty() ) continue;
+                                //if( !cimg_it->sandwiches_point_within_top_bottom_planes( cop.points.front() ) ) continue;
+                                const bool is_in_plane = cimg_it->sandwiches_point_within_top_bottom_planes(cop.points.front());
+
+                                if( !contouring_show_adjacent
+                                &&  !is_in_plane) continue;
+
+                                imgs_window_draw_list->PathClear();
+                                for(auto & p : cop.points){
+
+                                    //Clamp the point to the bounding box, using the top left as zero.
+                                    const auto dR = p - img_top_left;
+                                    const auto clamped_col = dR.Dot( cimg_it->row_unit ) / cimg_dicom_width;
+                                    const auto clamped_row = dR.Dot( cimg_it->col_unit ) / cimg_dicom_height;
+
+                                    //Convert to ImGui coordinates using the top-left position of the display image.
+                                    const auto world_x = real_pos.x + real_extent.x * clamped_col;
+                                    const auto world_y = real_pos.y + real_extent.y * clamped_row;
+
+                                    ImVec2 v;
+                                    v.x = world_x + (is_in_plane ? 0.0 : 0.1);
+                                    v.y = world_y;
+                                    imgs_window_draw_list->PathLineTo( v );
+                                }
+
+                                float thickness = contour_line_thickness;
+                                ImU32 colour = ImGui::GetColorU32(editing_contour_colour);
+
+                                if(is_in_plane){
+                                    if(contour_colour_from_orientation){
+                                        const auto arb_pos_unit = disp_img_it->row_unit.Cross(disp_img_it->col_unit).unit();
+                                        vec3<double> c_orient;
+                                        try{ // Protect against degenerate contours. (Should we instead ignore them altogether?)
+                                            c_orient = cop.Estimate_Planar_Normal();
+                                        }catch(const std::exception &){
+                                            c_orient = arb_pos_unit;
+                                        }
+                                        const auto c_orient_pos = (c_orient.Dot(arb_pos_unit) > 0);
+                                        colour = ( c_orient_pos ? ImGui::GetColorU32(pos_contour_colour)
+                                                                : ImGui::GetColorU32(neg_contour_colour) );
+                                    }
+                                }else{
+                                    colour = ImGui::GetColorU32(adjacent_contour_colour);
+                                    //thickness = contour_line_thickness;
+                                }
+
+                                const bool closed = true;
+                                imgs_window_draw_list->PathStroke( colour, closed, thickness);
+                                //AddPolyline(const ImVec2* points, int num_points, ImU32 col, bool closed, float thickness);
                             }
                         }
                     }
-                    for(std::size_t i = 0U; i < sketch.primitive_count(); ++i){
-                        const auto *primitive = sketch.primitive(i);
-                        if(primitive == nullptr) continue;
+                }
+                ImGui::End();
+            }
 
-                        const auto primitive_vertices = primitive->referenced_vertices();
-                        const bool primitive_is_fully_constrained = std::all_of(primitive_vertices.begin(),
-                                                                                primitive_vertices.end(),
-                                                                                [&](const auto vertex_idx){
-                                                                                    return fully_constrained_vertices.find(vertex_idx) != fully_constrained_vertices.end();
-                                                                                });
-                        if(primitive_is_fully_constrained){
-                            fully_constrained_primitives.insert(i);
+            // Draw a tooltip with position and voxel intensity information.
+            if( image_mouse_pos.mouse_hovering_image
+            &&  view_toggles.show_image_hover_tooltips
+            &&  !view_toggles.view_contouring_enabled ){
+                ImGui::BeginTooltip();
+                if(tagged_pos){
+                    ImGui::Text("Distance: %.4f", tagged_pos.value().distance(image_mouse_pos.dicom_pos));
+                }
+                ImGui::Text("Image coordinates: %.4f, %.4f", image_mouse_pos.region_y, image_mouse_pos.region_x);
+                ImGui::Text("Pixel coordinates: (r, c) = %" PRId64 ", %" PRId64, image_mouse_pos.r, image_mouse_pos.c);
+                ImGui::Text("Mouse coordinates: (x, y, z) = %.4f, %.4f, %.4f", image_mouse_pos.dicom_pos.x, image_mouse_pos.dicom_pos.y, image_mouse_pos.dicom_pos.z);
+                ImGui::Text("Voxel coordinates: (x, y, z) = %.4f, %.4f, %.4f", image_mouse_pos.voxel_pos.x, image_mouse_pos.voxel_pos.y, image_mouse_pos.voxel_pos.z);
+                if(disp_img_it->channels == 1){
+                    ImGui::Text("Voxel intensity:   %.4f", disp_img_it->value(image_mouse_pos.r, image_mouse_pos.c, 0L));
+                    try{
+                        const auto frc = disp_img_it->fractional_row_column(image_mouse_pos.dicom_pos);
+                        const auto bilin_interp = disp_img_it->bilinearly_interpolate_in_pixel_number_space(frc.first, frc.second, 0L);
+                        ImGui::Text("Mouse intensity:   %.4f (lin. interp. at %.4f, %.4f)", bilin_interp, frc.first, frc.second);
+                    }catch(const std::exception &){}
+                }else{
+                    std::stringstream ss;
+                    for(int64_t chan = 0; chan < disp_img_it->channels; ++chan){
+                        ss << disp_img_it->value(image_mouse_pos.r, image_mouse_pos.c, chan) << " ";
+                    }
+                    ImGui::Text("Voxel intensities: %s", ss.str().c_str());
+                }
+                ImGui::EndTooltip();
+            }
+            ImGui::End();
+
+            // Extract data for row and column profiles.
+            if( image_mouse_pos.mouse_hovering_image
+            &&  view_toggles.view_row_column_profiles ){
+                row_profile.samples.clear();
+                col_profile.samples.clear();
+
+                auto common_metadata = coalesce_metadata_for_lsamp(disp_img_it->metadata);
+
+                for(auto i = 0; i < disp_img_it->columns; ++i){
+                    const auto val_raw = disp_img_it->value(image_mouse_pos.r,i,img_channel);
+                    const auto col_num = static_cast<double>(i);
+                    if(std::isfinite(val_raw)) row_profile.push_back({ col_num, 0.0, val_raw, 0.0 });
+                }
+
+                for(auto i = 0; i < disp_img_it->rows; ++i){
+                    const auto val_raw = disp_img_it->value(i,image_mouse_pos.c,img_channel);
+                    const auto row_num = static_cast<double>(i);
+                    if(std::isfinite(val_raw)) col_profile.push_back({ row_num, 0.0, val_raw, 0.0 });
+                }
+
+                row_profile.metadata = common_metadata;
+                row_profile.metadata["Abscissa"] = "ColumnNumber";
+                row_profile.metadata["CurrentAbscissa"] = std::to_string(image_mouse_pos.c);
+
+                col_profile.metadata = common_metadata;
+                col_profile.metadata["Abscissa"] = "RowNumber";
+                col_profile.metadata["CurrentAbscissa"] = std::to_string(image_mouse_pos.r);
+            }
+
+            // Extract data for time profiles.
+            if( image_mouse_pos.mouse_hovering_image
+            &&  view_toggles.view_time_profiles ){
+                time_profile.samples.clear();
+                time_profile.metadata.clear();
+
+                std::string abscissa_key; //As it appears in the metadata. Must convert to a double!
+                array_to_string(abscissa_key, time_course_abscissa_key);
+                const auto meta_key = disp_img_it->GetMetadataValueAs<double>(abscissa_key);
+
+                double n_img = 0.0;
+                const bool sort_on_append = false;
+
+                const auto ortho = disp_img_it->row_unit.Cross( disp_img_it->col_unit ).unit();
+                const std::list<vec3<double>> points = { image_mouse_pos.dicom_pos,
+                                                         image_mouse_pos.dicom_pos + ortho * disp_img_it->pxl_dz * 0.25,
+                                                         image_mouse_pos.dicom_pos - ortho * disp_img_it->pxl_dz * 0.25 };
+
+                decltype((*img_array_ptr_it)->imagecoll.get_all_images()) selected_imgs;
+                if(time_course_image_inclusivity == time_course_image_inclusivity_t::current){
+                    auto encompassing_images = (*img_array_ptr_it)->imagecoll.get_images_which_encompass_all_points(points);
+                    selected_imgs.splice( std::end(selected_imgs), encompassing_images);
+
+                }else if(time_course_image_inclusivity == time_course_image_inclusivity_t::all){
+                    for(const auto &img_arr_ptr : DICOM_data.image_data){
+                        auto encompassing_images = img_arr_ptr->imagecoll.get_images_which_encompass_all_points(points);
+                        selected_imgs.splice( std::end(selected_imgs), encompassing_images);
+                    }
+
+                }else{
+                    throw std::invalid_argument("Unrecognized abscissa inclusisivity");
+                }
+                auto common_metadata = planar_image_collection<float,double>().get_common_metadata(selected_imgs);
+                common_metadata = coalesce_metadata_for_lsamp(common_metadata);
+
+                //Cycle over the images, dumping the ordinate (pixel values) vs abscissa (time) derived from metadata.
+                int64_t n_current_img = 0;
+                for(const auto &enc_img_it : selected_imgs){
+                    const auto l_meta_key = enc_img_it->GetMetadataValueAs<double>(abscissa_key);
+                    if(l_meta_key.has_value() != meta_key.has_value()) continue;
+                    const auto abscissa = l_meta_key.value_or(n_img);
+
+                    if(std::addressof(*disp_img_it) == std::addressof(*enc_img_it)) n_current_img = n_img;
+                    try{
+                        const auto val_raw = enc_img_it->value(image_mouse_pos.dicom_pos, 0);
+                        if(std::isfinite(val_raw)){
+                            time_profile.push_back( abscissa, 0.0, 
+                                                    static_cast<double>(val_raw), 0.0,
+                                                    sort_on_append );
                         }
-                    }
-                    const auto constrained_colour = ImColor(0.30f, 1.00f, 0.65f, 1.00f);
-                    const auto hovered_constraint_colour = ImColor(1.00f, 0.82f, 0.22f, 1.00f);
-                    std::vector<std::optional<vec3<double>>> primitive_label_positions;
-                    std::vector<std::optional<vec3<double>>> constraint_label_positions;
-                    std::vector<std::optional<Sketch::geometry_tag_t>> vertex_label_tags;
-                    if(sketch_show_primitive_numbers || sketch_show_constraint_numbers){
-                        primitive_label_positions.resize(sketch.primitive_count());
-                    }
-                    if(sketch_show_constraint_numbers){
-                        constraint_label_positions.resize(sketch.constraint_count());
-                    }
-                    if(sketch_show_vertex_numbers){
-                        vertex_label_tags.resize(sketch.vertex_count());
-                    }
+                    }catch(const std::exception &){ }
+                    n_img += 1.0;
+                }
+                time_profile.stable_sort();
+                time_profile.metadata = common_metadata;
+                time_profile.metadata["Abscissa"] = (meta_key) ? abscissa_key : "ImageNumber";
+                time_profile.metadata["CurrentAbscissa"] = (meta_key) ? std::to_string(meta_key.value()) : std::to_string(n_current_img);
 
-                    for(std::size_t i = 0U; i < sketch.primitive_count(); ++i){
-                        const auto *primitive = sketch.primitive(i);
-                        if(primitive == nullptr) continue;
+                if( time_course_abscissa_relative
+                &&  !time_profile.samples.empty() ){
+                    const auto first_a = time_profile.Get_Extreme_Datum_x().first[0];
+                    time_profile = time_profile.Sum_x_With(-first_a);
+                    apply_as<double>(time_profile.metadata, "CurrentAbscissa",
+                                     [first_a](double x){ return x - first_a; });
+                }
+            }
 
-                        const bool is_selected = (slot.selection.count(i) != 0U);
-                        const bool is_hovered = effective_hovered_primitive && (effective_hovered_primitive.value() == i);
-                        const bool constraint_hovered = (constraint_highlight_primitives.count(i) != 0U);
-                        const bool is_fully_constrained = (fully_constrained_primitives.count(i) != 0U);
-                        const auto referenced_vertices = primitive->referenced_vertices();
-                        const auto base_colour = sketch_tag_colour(primitive->tag);
-                        auto colour = base_colour;
-                        if(is_selected){
-                            colour = ImColor(0.10f, 1.00f, 0.35f, 1.00f);
-                        }else if(is_hovered){
-                            colour = ImColor(1.00f, 1.00f, 0.20f, 1.00f);
-                        }else if(constraint_hovered){
-                            colour = hovered_constraint_colour;
-                        }else if(is_fully_constrained){
-                            colour = constrained_colour;
-                        }
+            // Image metadata window.
+            if( view_toggles.view_image_metadata_enabled ){
+                ImGui::SetNextWindowSize(ImVec2(650, 650), ImGuiCond_FirstUseEver);
+                ImGui::Begin("Image Metadata", &view_toggles.view_image_metadata_enabled);
 
-                        const float thickness = is_selected ? 3.0f : (is_hovered ? 2.5f : 1.5f);
-                        const auto samples = sketch.sample_primitive(i, 48U);
-                        if(const auto *vertex_primitive = dynamic_cast<const Sketch::vertex_primitive_t*>(primitive); vertex_primitive != nullptr){
-                            const auto p = image_mouse_pos.DICOM_to_pixels(sketch.vertex(vertex_primitive->vertex));
-                            const float radius = is_selected ? 6.0f : (is_hovered ? 5.5f : 5.0f);
-                            imgs_window_draw_list->AddCircle(p, radius, colour, 0, thickness);
-                            imgs_window_draw_list->AddLine(ImVec2(p.x - radius * 0.5f, p.y - radius * 0.5f),
-                                                           ImVec2(p.x + radius * 0.5f, p.y + radius * 0.5f),
-                                                           colour,
-                                                           thickness);
-                            imgs_window_draw_list->AddLine(ImVec2(p.x - radius * 0.5f, p.y + radius * 0.5f),
-                                                           ImVec2(p.x + radius * 0.5f, p.y - radius * 0.5f),
-                                                           colour,
-                                                           thickness);
-                        }else if(samples.size() == 1U){
-                            imgs_window_draw_list->AddCircleFilled(image_mouse_pos.DICOM_to_pixels(samples.front()), 4.0f, colour);
+                display_metadata_table( disp_img_it->metadata );
+
+                ImGui::End();
+            }
+            image_mouse_pos_opt = image_mouse_pos;
+            return;
+        };
+        try{
+            display_image_viewer();
+        }catch(const std::exception &e){
+            YLOGWARN("Exception in display_image_viewer(): '" << e.what() << "'");
+            throw;
+        }
+
+        const auto display_sketch_viewer = [&view_toggles,
+                                            &DICOM_data,
+                                            &drover_mutex,
+                                            &mutex_dt,
+                                            &recompute_image_iters,
+
+                                            &pending_sketch_plane_adoption,
+                                            &adopt_sketch_plane,
+                                            &sketch_mesh_face_adoption,
+                                            &sketch_hovered_primitive,
+                                            &sketch_hovered_vertex,
+                                            &sketch_hovered_constraint,
+                                            &sketch_editor_hovered_primitive,
+                                            &sketch_editor_hovered_vertex,
+                                            &sketch_editor_hovered_constraint,
+                                            &current_sketch_slot,
+                                            &default_sketch_plane,
+                                            &sketch_image_geometry,
+                                            &sketch_canvas_view,
+                                            &sketch_pending_primitive,
+                                            &sketch_show_primitive_numbers,
+                                            &sketch_show_constraint_numbers,
+                                            &sketch_show_vertex_numbers,
+                                            &sketch_drag_state,
+                                            &sketch_tool_mode,
+                                            &sketch_solve_options,
+                                            &configured_sketch_solve_options,
+                                            &sketch_constrain_to_image_frame,
+                                            &sketch_solve_on_edit,
+                                            &sketch_fillet_radius,
+                                            &sketch_snap_distance,
+                                            &sketch_snap_direction,
+                                            &sketch_tag_colour,
+                                            &sketch_constraint_indicator,
+                                            &sketch_is_compatible_with_image,
+                                            &sketch_add_image_boundary_on_plane_adopt,
+                                            &sketch_extrude_into_frame,
+                                            &sketch_extrude_out_of_frame,
+                                            &sketch_extrude_into_frame_angle,
+                                            &sketch_extrude_out_of_frame_angle,
+                                            &sketch_extrude_max_discretization_error,
+                                            &sketch_export_extrusion_caps,
+                                            &sketch_log_entries,
+                                            &sketch_log_scroll_to_bottom,
+                                            &sketch_file_status,
+                                            &sketch_save_path,
+                                            &sketch_load_path,
+                                            &sketch_last_unresolved_constraints,
+                                            &sketch_numeric_constraint_popup,
+                                            &view_sketch_editor_enabled,
+                                            &ensure_sketch_slots,
+                                            &sketch_slots,
+                                            &sketch_slot_num,
+                                            &clear_sketch_interaction_state,
+                                            &reset_sketch_slot,
+                                            &append_sketch_log,
+                                            &append_sketch_summary_log,
+                                            &create_sketch_snapshot,
+                                            &solve_sketch_after_edit,
+                                            &apply_sketch_edit,
+                                            &clamp_point_to_current_sketch_bounds,
+                                            &ensure_sketch_plane ]() -> void {
+            if(pending_sketch_plane_adoption){
+                adopt_sketch_plane(pending_sketch_plane_adoption->plane,
+                                   pending_sketch_plane_adoption->support_loops,
+                                   disp_img_it_t(),
+                                   "Adopted sketch plane geometry");
+                pending_sketch_plane_adoption = {};
+                sketch_mesh_face_adoption.active = false;
+            }
+
+            if(!view_toggles.view_vector_sketching_enabled){
+                sketch_hovered_primitive = {};
+                sketch_hovered_vertex = {};
+                sketch_hovered_constraint = {};
+                sketch_editor_hovered_primitive = {};
+                sketch_editor_hovered_vertex = {};
+                sketch_editor_hovered_constraint = {};
+                view_sketch_editor_enabled = false;
+                return;
+            }
+
+            bool img_valid = false;
+            disp_img_it_t disp_img_it = disp_img_it_t();
+            {
+                std::unique_lock<std::shared_timed_mutex> drover_lock(drover_mutex, mutex_dt);
+                if(drover_lock){
+                    auto [l_img_valid, l_img_array_ptr_it, l_disp_img_it] = recompute_image_iters();
+                    (void)l_img_array_ptr_it;
+                    img_valid = l_img_valid;
+                    disp_img_it = l_disp_img_it;
+                }
+            }
+
+            auto &slot = current_sketch_slot();
+            auto &sketch = slot.history.current();
+            const auto sketch_matches_display_image = [&](const Sketch &active_sketch) -> bool {
+                return active_sketch.has_plane()
+                    && ((disp_img_it == disp_img_it_t()) || sketch_is_compatible_with_image(active_sketch, disp_img_it));
+            };
+            const auto canvas_plane = sketch.has_plane() ? sketch.plane() : default_sketch_plane();
+            const auto sketch_canvas_selection_tolerance = [](const image_mouse_pos_s &mouse_pos) -> double {
+                return std::max<double>(4.0 / std::max<double>(mouse_pos.pixel_scale, 1.0E-3f), 0.25);
+            };
+
+            auto bounds_min = Sketch::projection_t{ std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity() };
+            auto bounds_max = Sketch::projection_t{ -std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity() };
+            auto incorporate_projection = [&](const Sketch::projection_t &p_proj) -> void {
+                bounds_min.u = std::min(bounds_min.u, p_proj.u);
+                bounds_min.v = std::min(bounds_min.v, p_proj.v);
+                bounds_max.u = std::max(bounds_max.u, p_proj.u);
+                bounds_max.v = std::max(bounds_max.v, p_proj.v);
+            };
+            if(sketch.has_plane()){
+                for(std::size_t i = 0U; i < sketch.vertex_count(); ++i){
+                    incorporate_projection(sketch.project(sketch.vertex(i)));
+                }
+            }
+            if((!std::isfinite(bounds_min.u) || !std::isfinite(bounds_max.u)) && sketch_image_geometry){
+                incorporate_projection(sketch_image_geometry->bounds.min);
+                incorporate_projection(sketch_image_geometry->bounds.max);
+            }
+            if(!std::isfinite(bounds_min.u) || !std::isfinite(bounds_max.u)){
+                bounds_min = Sketch::projection_t{ -50.0, -50.0 };
+                bounds_max = Sketch::projection_t{  50.0,  50.0 };
+            }
+            auto bounds_width = std::max(10.0, bounds_max.u - bounds_min.u);
+            auto bounds_height = std::max(10.0, bounds_max.v - bounds_min.v);
+            const auto bounds_centre = Sketch::projection_t{ 0.5 * (bounds_min.u + bounds_max.u),
+                                                              0.5 * (bounds_min.v + bounds_max.v) };
+            if(!sketch_canvas_view.framing_initialized){
+                sketch_canvas_view.centre = bounds_centre;
+                sketch_canvas_view.zoom = 1.0;
+                sketch_canvas_view.framing_initialized = true;
+            }
+
+            std::optional<image_mouse_pos_s> image_mouse_pos_opt;
+            std::optional<bool> canvas_hovered_opt;
+            std::optional<bool> canvas_active_opt;
+
+            ImGuiIO &io = ImGui::GetIO();
+
+            constexpr float kSketchCanvasMinExtent = 180.0f;
+            constexpr double kSketchCanvasMargin = 20.0;
+            if(view_toggles.view_vector_sketching_enabled){
+                ImGui::SetNextWindowSize(ImVec2(650.0f, 650.0f), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowPos(ImVec2(10.0f, 40.0f), ImGuiCond_FirstUseEver);
+                ImGui::Begin("Sketch", &view_toggles.view_vector_sketching_enabled, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                const auto canvas_origin = ImGui::GetCursorScreenPos();
+                auto canvas_extent = ImGui::GetContentRegionAvail();
+                canvas_extent.x = std::max(canvas_extent.x, kSketchCanvasMinExtent);
+                canvas_extent.y = std::max(canvas_extent.y, kSketchCanvasMinExtent);
+                ImGui::InvisibleButton("##sketch_canvas", canvas_extent, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle | ImGuiButtonFlags_MouseButtonRight);
+                canvas_hovered_opt = ImGui::IsItemHovered();
+                canvas_active_opt = ImGui::IsItemActive();
+                const double scale = std::max(1.0, std::min((static_cast<double>(canvas_extent.x) - kSketchCanvasMargin) / (bounds_width / sketch_canvas_view.zoom),
+                                                            (static_cast<double>(canvas_extent.y) - kSketchCanvasMargin) / (bounds_height / sketch_canvas_view.zoom)));
+                if(canvas_hovered_opt && canvas_hovered_opt.value() && (std::abs(io.MouseWheel) > 0.0f)){
+                    const auto zoom_scale = std::pow(1.10, static_cast<double>(io.MouseWheel));
+                    sketch_canvas_view.zoom = std::clamp(sketch_canvas_view.zoom * zoom_scale, 0.1, 100.0);
+                }
+                if(canvas_active_opt && canvas_active_opt.value() && ImGui::IsMouseDragging(ImGuiMouseButton_Middle)){
+                    const auto delta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Middle);
+                    sketch_canvas_view.centre.u -= static_cast<double>(delta.x) / scale;
+                    sketch_canvas_view.centre.v += static_cast<double>(delta.y) / scale;
+                    ImGui::ResetMouseDragDelta(ImGuiMouseButton_Middle);
+                }
+                const auto world_to_pixels = [&](const vec3<double> &point) -> ImVec2 {
+                    const auto projected = (sketch.has_plane() ? sketch.project(point) : Sketch::projection_t{ (point - canvas_plane.origin).Dot(canvas_plane.row_unit),
+                                                                                                                (point - canvas_plane.origin).Dot(canvas_plane.col_unit) });
+                    const auto px = canvas_origin.x + canvas_extent.x * 0.5f + static_cast<float>((projected.u - sketch_canvas_view.centre.u) * scale);
+                    const auto py = canvas_origin.y + canvas_extent.y * 0.5f - static_cast<float>((projected.v - sketch_canvas_view.centre.v) * scale);
+                    return ImVec2(px, py);
+                };
+                {
+                    image_mouse_pos_s image_mouse_pos{};
+                    image_mouse_pos.mouse_hovering_image = canvas_hovered_opt.value();
+                    image_mouse_pos.image_window_focused = ImGui::IsWindowFocused();
+                    image_mouse_pos.image_window_hovered = ImGui::IsWindowHovered();
+                    if(canvas_hovered_opt && canvas_hovered_opt.value()){
+                        image_mouse_pos.region_x = std::clamp((io.MousePos.x - canvas_origin.x) / std::max(canvas_extent.x, 1.0f), 0.0f, 1.0f);
+                        image_mouse_pos.region_y = std::clamp((io.MousePos.y - canvas_origin.y) / std::max(canvas_extent.y, 1.0f), 0.0f, 1.0f);
+                    }
+                    image_mouse_pos.pixel_scale = static_cast<float>(scale);
+                    image_mouse_pos.DICOM_to_pixels = world_to_pixels;
+                    const auto plane_u = sketch_canvas_view.centre.u + (static_cast<double>(io.MousePos.x - (canvas_origin.x + canvas_extent.x * 0.5f)) / scale);
+                    const auto plane_v = sketch_canvas_view.centre.v - (static_cast<double>(io.MousePos.y - (canvas_origin.y + canvas_extent.y * 0.5f)) / scale);
+                    image_mouse_pos.dicom_pos = canvas_plane.origin + canvas_plane.row_unit * plane_u + canvas_plane.col_unit * plane_v;
+                    image_mouse_pos.zero_pos = canvas_plane.origin;
+                    image_mouse_pos.voxel_pos = image_mouse_pos.dicom_pos;
+                    image_mouse_pos_opt = image_mouse_pos;
+                }
+
+                auto *imgs_window_draw_list = ImGui::GetWindowDrawList();
+                imgs_window_draw_list->AddRectFilled(canvas_origin, ImVec2(canvas_origin.x + canvas_extent.x, canvas_origin.y + canvas_extent.y), ImColor(0.05f, 0.07f, 0.10f, 1.0f));
+                imgs_window_draw_list->AddRect(canvas_origin, ImVec2(canvas_origin.x + canvas_extent.x, canvas_origin.y + canvas_extent.y), ImColor(0.35f, 0.45f, 0.55f, 1.0f));
+
+                if( view_toggles.view_vector_sketching_enabled
+                &&  image_mouse_pos_opt
+                &&  image_mouse_pos_opt.value().DICOM_to_pixels ){
+                    auto &slot = current_sketch_slot();
+                    auto &sketch = slot.history.current();
+                    const bool sketch_compatible = sketch_matches_display_image(sketch);
+
+                    if( image_mouse_pos_opt.value().mouse_hovering_image
+                    &&  sketch_compatible ){
+                        const auto tol = sketch_canvas_selection_tolerance(image_mouse_pos_opt.value());
+                        if(const auto hovered_vertex = sketch.nearest_primitive_vertex(image_mouse_pos_opt.value().dicom_pos, tol); hovered_vertex){
+                            sketch_hovered_primitive = hovered_vertex->first;
+                            sketch_hovered_vertex = hovered_vertex->second;
                         }else{
-                            for(std::size_t j = 1U; j < samples.size(); ++j){
-                                imgs_window_draw_list->AddLine(image_mouse_pos.DICOM_to_pixels(samples[j - 1U]),
-                                                               image_mouse_pos.DICOM_to_pixels(samples[j]),
+                            sketch_hovered_primitive = sketch.nearest_primitive(image_mouse_pos_opt.value().dicom_pos, tol);
+                            sketch_hovered_vertex = {};
+                        }
+                        sketch_hovered_constraint = {};
+                    }else if(!sketch_drag_state.selection_box_active){
+                        sketch_hovered_primitive = {};
+                        sketch_hovered_vertex = {};
+                        sketch_hovered_constraint = {};
+                    }
+
+                    if(sketch_compatible){
+                        const auto effective_hovered_primitive = sketch_hovered_primitive ? sketch_hovered_primitive
+                                                                                          : sketch_editor_hovered_primitive;
+                        const auto effective_hovered_vertex = sketch_hovered_vertex ? sketch_hovered_vertex
+                                                                                    : sketch_editor_hovered_vertex;
+                        const auto effective_hovered_constraint = sketch_hovered_constraint ? sketch_hovered_constraint
+                                                                                            : sketch_editor_hovered_constraint;
+                        const auto fully_constrained_vertices = sketch.fully_constrained_vertices();
+                        std::set<Sketch::primitive_index_t> fully_constrained_primitives;
+                        auto constraint_highlight_vertices = std::set<Sketch::vertex_index_t>{};
+                        auto constraint_highlight_primitives = std::set<Sketch::primitive_index_t>{};
+                        if(effective_hovered_constraint){
+                            if(const auto *hovered_constraint = sketch.constraint(effective_hovered_constraint.value()); hovered_constraint != nullptr){
+                                const auto referenced_primitives = hovered_constraint->referenced_primitives();
+                                constraint_highlight_primitives.insert(std::begin(referenced_primitives), std::end(referenced_primitives));
+                                const auto referenced_vertices = hovered_constraint->referenced_vertices();
+                                constraint_highlight_vertices.insert(std::begin(referenced_vertices), std::end(referenced_vertices));
+                                for(const auto primitive_idx : referenced_primitives){
+                                    if(const auto *referenced_primitive = sketch.primitive(primitive_idx); referenced_primitive != nullptr){
+                                        const auto primitive_vertices = referenced_primitive->referenced_vertices();
+                                        constraint_highlight_vertices.insert(std::begin(primitive_vertices), std::end(primitive_vertices));
+                                    }
+                                }
+                            }
+                        }
+                        for(std::size_t i = 0U; i < sketch.primitive_count(); ++i){
+                            const auto *primitive = sketch.primitive(i);
+                            if(primitive == nullptr) continue;
+
+                            const auto primitive_vertices = primitive->referenced_vertices();
+                            const bool primitive_is_fully_constrained = std::all_of(primitive_vertices.begin(),
+                                                                                    primitive_vertices.end(),
+                                                                                    [&](const auto vertex_idx){
+                                                                                        return fully_constrained_vertices.find(vertex_idx) != fully_constrained_vertices.end();
+                                                                                    });
+                            if(primitive_is_fully_constrained){
+                                fully_constrained_primitives.insert(i);
+                            }
+                        }
+                        const auto constrained_colour = ImColor(0.30f, 1.00f, 0.65f, 1.00f);
+                        const auto hovered_constraint_colour = ImColor(1.00f, 0.82f, 0.22f, 1.00f);
+                        std::vector<std::optional<vec3<double>>> primitive_label_positions;
+                        std::vector<std::optional<vec3<double>>> constraint_label_positions;
+                        std::vector<std::optional<Sketch::geometry_tag_t>> vertex_label_tags;
+                        if(sketch_show_primitive_numbers || sketch_show_constraint_numbers){
+                            primitive_label_positions.resize(sketch.primitive_count());
+                        }
+                        if(sketch_show_constraint_numbers){
+                            constraint_label_positions.resize(sketch.constraint_count());
+                        }
+                        if(sketch_show_vertex_numbers){
+                            vertex_label_tags.resize(sketch.vertex_count());
+                        }
+
+                        for(std::size_t i = 0U; i < sketch.primitive_count(); ++i){
+                            const auto *primitive = sketch.primitive(i);
+                            if(primitive == nullptr) continue;
+
+                            const bool is_selected = (slot.selection.count(i) != 0U);
+                            const bool is_hovered = effective_hovered_primitive && (effective_hovered_primitive.value() == i);
+                            const bool constraint_hovered = (constraint_highlight_primitives.count(i) != 0U);
+                            const bool is_fully_constrained = (fully_constrained_primitives.count(i) != 0U);
+                            const auto referenced_vertices = primitive->referenced_vertices();
+                            const auto base_colour = sketch_tag_colour(primitive->tag);
+                            auto colour = base_colour;
+                            if(is_selected){
+                                colour = ImColor(0.10f, 1.00f, 0.35f, 1.00f);
+                            }else if(is_hovered){
+                                colour = ImColor(1.00f, 1.00f, 0.20f, 1.00f);
+                            }else if(constraint_hovered){
+                                colour = hovered_constraint_colour;
+                            }else if(is_fully_constrained){
+                                colour = constrained_colour;
+                            }
+
+                            const float thickness = is_selected ? 3.0f : (is_hovered ? 2.5f : 1.5f);
+                            const auto samples = sketch.sample_primitive(i, 48U);
+                            if(const auto *vertex_primitive = dynamic_cast<const Sketch::vertex_primitive_t*>(primitive); vertex_primitive != nullptr){
+                                const auto p = image_mouse_pos_opt.value().DICOM_to_pixels(sketch.vertex(vertex_primitive->vertex));
+                                const float radius = is_selected ? 6.0f : (is_hovered ? 5.5f : 5.0f);
+                                imgs_window_draw_list->AddCircle(p, radius, colour, 0, thickness);
+                                imgs_window_draw_list->AddLine(ImVec2(p.x - radius * 0.5f, p.y - radius * 0.5f),
+                                                               ImVec2(p.x + radius * 0.5f, p.y + radius * 0.5f),
                                                                colour,
                                                                thickness);
-                            }
-                        }
-
-                        const bool has_selected_vertex = std::any_of(std::begin(referenced_vertices),
-                                                                     std::end(referenced_vertices),
-                                                                     [&](const auto vertex_idx){
-                                                                         return slot.vertex_selection.count(vertex_idx) != 0U;
-                                                                     });
-                        const bool has_constrained_vertex = std::any_of(std::begin(referenced_vertices),
-                                                                        std::end(referenced_vertices),
-                                                                        [&](const auto vertex_idx){
-                                                                            return fully_constrained_vertices.count(vertex_idx) != 0U;
-                                                                        });
-                        if(is_selected || is_hovered || constraint_hovered || has_selected_vertex || has_constrained_vertex){
-                            for(const auto vertex_idx : referenced_vertices){
-                                const auto p = image_mouse_pos.DICOM_to_pixels(sketch.vertex(vertex_idx));
-                                const bool vertex_selected = (slot.vertex_selection.count(vertex_idx) != 0U);
-                                const bool vertex_hovered = effective_hovered_vertex && (effective_hovered_vertex.value() == vertex_idx);
-                                const bool constraint_vertex_hovered = (constraint_highlight_vertices.count(vertex_idx) != 0U);
-                                const bool vertex_constrained = (fully_constrained_vertices.count(vertex_idx) != 0U);
-                                const auto vertex_fill = vertex_selected ? ImColor(1.00f, 0.35f, 0.95f, 1.00f)
-                                                                          : (vertex_hovered ? ImColor(1.00f, 1.00f, 0.25f, 1.00f)
-                                                                                            : (constraint_vertex_hovered ? hovered_constraint_colour
-                                                                                                                         : (vertex_constrained ? constrained_colour
-                                                                                                                                               : ImColor(1.0f, 1.0f, 1.0f, 0.95f))));
-                                const auto vertex_outline = vertex_selected ? ImColor(1.00f, 0.10f, 0.80f, 1.00f)
-                                                                            : (constraint_vertex_hovered ? hovered_constraint_colour
-                                                                                                          : (vertex_constrained ? constrained_colour
-                                                                                                                                : colour));
-                                imgs_window_draw_list->AddCircleFilled(p, vertex_selected ? 4.5f : 4.0f, vertex_fill);
-                                imgs_window_draw_list->AddCircle(p, vertex_selected ? 6.0f : 5.0f, vertex_outline, 0, vertex_selected ? 2.0f : 1.5f);
-                            }
-                        }
-
-                        if(sketch_show_primitive_numbers || sketch_show_constraint_numbers || sketch_show_vertex_numbers){
-                            if(!samples.empty()){
-                                if(!primitive_label_positions.empty()){
-                                    primitive_label_positions.at(i) = samples.at(samples.size() / 2U);
+                                imgs_window_draw_list->AddLine(ImVec2(p.x - radius * 0.5f, p.y + radius * 0.5f),
+                                                               ImVec2(p.x + radius * 0.5f, p.y - radius * 0.5f),
+                                                               colour,
+                                                               thickness);
+                            }else if(samples.size() == 1U){
+                                imgs_window_draw_list->AddCircleFilled(image_mouse_pos_opt.value().DICOM_to_pixels(samples.front()), 4.0f, colour);
+                            }else{
+                                for(std::size_t j = 1U; j < samples.size(); ++j){
+                                    imgs_window_draw_list->AddLine(image_mouse_pos_opt.value().DICOM_to_pixels(samples[j - 1U]),
+                                                                   image_mouse_pos_opt.value().DICOM_to_pixels(samples[j]),
+                                                                   colour,
+                                                                   thickness);
                                 }
                             }
-                            for(const auto vertex_idx : referenced_vertices){
-                                if(vertex_idx < vertex_label_tags.size()){
-                                    auto &tag_slot = vertex_label_tags.at(vertex_idx);
-                                    if(!tag_slot || (tag_slot.value() == Sketch::geometry_tag_t::support && primitive->tag == Sketch::geometry_tag_t::normal)){
-                                        tag_slot = primitive->tag;
+
+                            const bool has_selected_vertex = std::any_of(std::begin(referenced_vertices),
+                                                                         std::end(referenced_vertices),
+                                                                         [&](const auto vertex_idx){
+                                                                             return slot.vertex_selection.count(vertex_idx) != 0U;
+                                                                         });
+                            const bool has_constrained_vertex = std::any_of(std::begin(referenced_vertices),
+                                                                            std::end(referenced_vertices),
+                                                                            [&](const auto vertex_idx){
+                                                                                return fully_constrained_vertices.count(vertex_idx) != 0U;
+                                                                            });
+                            if(is_selected || is_hovered || constraint_hovered || has_selected_vertex || has_constrained_vertex){
+                                for(const auto vertex_idx : referenced_vertices){
+                                    const auto p = image_mouse_pos_opt.value().DICOM_to_pixels(sketch.vertex(vertex_idx));
+                                    const bool vertex_selected = (slot.vertex_selection.count(vertex_idx) != 0U);
+                                    const bool vertex_hovered = effective_hovered_vertex && (effective_hovered_vertex.value() == vertex_idx);
+                                    const bool constraint_vertex_hovered = (constraint_highlight_vertices.count(vertex_idx) != 0U);
+                                    const bool vertex_constrained = (fully_constrained_vertices.count(vertex_idx) != 0U);
+                                    const auto vertex_fill = vertex_selected ? ImColor(1.00f, 0.35f, 0.95f, 1.00f)
+                                                                              : (vertex_hovered ? ImColor(1.00f, 1.00f, 0.25f, 1.00f)
+                                                                                                : (constraint_vertex_hovered ? hovered_constraint_colour
+                                                                                                                             : (vertex_constrained ? constrained_colour
+                                                                                                                                                   : ImColor(1.0f, 1.0f, 1.0f, 0.95f))));
+                                    const auto vertex_outline = vertex_selected ? ImColor(1.00f, 0.10f, 0.80f, 1.00f)
+                                                                                : (constraint_vertex_hovered ? hovered_constraint_colour
+                                                                                                              : (vertex_constrained ? constrained_colour
+                                                                                                                                    : colour));
+                                    imgs_window_draw_list->AddCircleFilled(p, vertex_selected ? 4.5f : 4.0f, vertex_fill);
+                                    imgs_window_draw_list->AddCircle(p, vertex_selected ? 6.0f : 5.0f, vertex_outline, 0, vertex_selected ? 2.0f : 1.5f);
+                                }
+                            }
+
+                            if(sketch_show_primitive_numbers || sketch_show_constraint_numbers || sketch_show_vertex_numbers){
+                                if(!samples.empty()){
+                                    if(!primitive_label_positions.empty()){
+                                        primitive_label_positions.at(i) = samples.at(samples.size() / 2U);
+                                    }
+                                }
+                                for(const auto vertex_idx : referenced_vertices){
+                                    if(vertex_idx < vertex_label_tags.size()){
+                                        auto &tag_slot = vertex_label_tags.at(vertex_idx);
+                                        if(!tag_slot || (tag_slot.value() == Sketch::geometry_tag_t::support && primitive->tag == Sketch::geometry_tag_t::normal)){
+                                            tag_slot = primitive->tag;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if( sketch_pending_primitive.active()
+                        &&  !sketch_pending_primitive.points.empty() ){
+                            auto preview_colour = sketch_tag_colour(sketch_pending_primitive.tag);
+                            std::vector<vec3<double>> preview_points = sketch_pending_primitive.points;
+                            if(image_mouse_pos_opt.value().mouse_hovering_image){
+                                auto preview_point = image_mouse_pos_opt.value().dicom_pos;
+                                if(io.KeyCtrl && sketch.has_plane() && !sketch_pending_primitive.points.empty()){
+                                    const bool angular_snap = (sketch_pending_primitive.kind == Sketch::primitive_kind_t::line)
+                                                           || (sketch_pending_primitive.kind == Sketch::primitive_kind_t::circle)
+                                                           || (sketch_pending_primitive.kind == Sketch::primitive_kind_t::arc);
+                                    if(angular_snap){
+                                        preview_point = sketch_snap_direction(sketch.plane(),
+                                                                             sketch_pending_primitive.points.front(),
+                                                                             preview_point);
+                                    }
+                                }
+                                if(0.0 < sketch_snap_distance){
+                                    if(const auto snapped_vertex = sketch.nearest_vertex(preview_point, sketch_snap_distance); snapped_vertex){
+                                        preview_point = sketch.vertex(snapped_vertex.value());
+                                    }
+                                }
+                                preview_points.push_back(preview_point);
+                            }
+                            const auto preview_plane = sketch.has_plane()
+                                                    ? std::optional<Sketch::plane_frame_t>(sketch.plane())
+                                                    : std::optional<Sketch::plane_frame_t>(canvas_plane);
+                            const bool show_circle_hint = preview_plane
+                                                       && ((sketch_pending_primitive.kind == Sketch::primitive_kind_t::circle)
+                                                        || (sketch_pending_primitive.kind == Sketch::primitive_kind_t::arc))
+                                                       && (preview_points.size() == 2U);
+                            const bool show_arc_preview = preview_plane
+                                                       && (sketch_pending_primitive.kind == Sketch::primitive_kind_t::arc)
+                                                       && (preview_points.size() == 3U);
+                            for(const auto &p : preview_points){
+                                imgs_window_draw_list->AddCircleFilled(image_mouse_pos_opt.value().DICOM_to_pixels(p), 3.5f, preview_colour);
+                            }
+                            if(show_circle_hint){
+                                const auto &centre = preview_points.front();
+                                const auto radius_point = preview_points.back();
+                                const auto radius = centre.distance(radius_point);
+                                if(std::numeric_limits<double>::epsilon() < radius){
+                                    constexpr std::size_t segments = 48U;
+                                    const auto radius_dir = radius_point - centre;
+                                    const auto start_theta = std::atan2(radius_dir.Dot(preview_plane->col_unit),
+                                                                        radius_dir.Dot(preview_plane->row_unit));
+                                    auto previous = radius_point;
+                                    for(std::size_t j = 1U; j <= segments; ++j){
+                                        const auto theta = start_theta
+                                                         + (2.0 * std::acos(-1.0) * static_cast<double>(j)) / static_cast<double>(segments);
+                                        const auto next = centre
+                                                        + preview_plane->row_unit * (std::cos(theta) * radius)
+                                                        + preview_plane->col_unit * (std::sin(theta) * radius);
+                                        imgs_window_draw_list->AddLine(image_mouse_pos_opt.value().DICOM_to_pixels(previous),
+                                                                       image_mouse_pos_opt.value().DICOM_to_pixels(next),
+                                                                       preview_colour,
+                                                                       1.5f);
+                                        previous = next;
+                                    }
+                                }
+                            }else if(show_arc_preview){
+                                const auto &centre = preview_points[0];
+                                const auto &start_point = preview_points[1];
+                                const auto &mouse_point = preview_points[2];
+                                const auto start_vec = start_point - centre;
+                                const auto start_u = start_vec.Dot(preview_plane->row_unit);
+                                const auto start_v = start_vec.Dot(preview_plane->col_unit);
+                                const auto radius = std::hypot(start_u, start_v);
+                                if(std::numeric_limits<double>::epsilon() < radius){
+                                    const auto mouse_vec = mouse_point - centre;
+                                    const auto mouse_u = mouse_vec.Dot(preview_plane->row_unit);
+                                    const auto mouse_v = mouse_vec.Dot(preview_plane->col_unit);
+                                    const auto start_angle = std::atan2(start_v, start_u);
+                                    const auto mouse_angle = std::atan2(mouse_v, mouse_u);
+                                    // Normalize both angles to [0, 2*pi) to match the behavior of
+                                    // Sketch::normalize_angle() and the final arc rendering loop,
+                                    // which always sweeps counterclockwise from start to stop.
+                                    const auto pi = std::acos(-1.0);
+                                    auto start_norm = start_angle;
+                                    auto mouse_norm = mouse_angle;
+                                    while(start_norm < 0.0) start_norm += 2.0 * pi;
+                                    while((2.0 * pi) <= start_norm) start_norm -= 2.0 * pi;
+                                    while(mouse_norm < 0.0) mouse_norm += 2.0 * pi;
+                                    while((2.0 * pi) <= mouse_norm) mouse_norm -= 2.0 * pi;
+                                    auto sweep = mouse_norm - start_norm;
+                                    if(sweep <= 0.0) sweep += 2.0 * pi;
+                                    constexpr std::size_t segments = 48U;
+                                    auto previous = start_point;
+                                    for(std::size_t j = 1U; j <= segments; ++j){
+                                        const auto theta = start_norm
+                                                         + (sweep * static_cast<double>(j)) / static_cast<double>(segments);
+                                        const auto next = centre
+                                                        + preview_plane->row_unit * (std::cos(theta) * radius)
+                                                        + preview_plane->col_unit * (std::sin(theta) * radius);
+                                        imgs_window_draw_list->AddLine(image_mouse_pos_opt.value().DICOM_to_pixels(previous),
+                                                                       image_mouse_pos_opt.value().DICOM_to_pixels(next),
+                                                                       preview_colour,
+                                                                       2.0f);
+                                        previous = next;
+                                    }
+                                }
+                            }else{
+                                for(std::size_t j = 1U; j < preview_points.size(); ++j){
+                                    imgs_window_draw_list->AddLine(image_mouse_pos_opt.value().DICOM_to_pixels(preview_points[j - 1U]),
+                                                                   image_mouse_pos_opt.value().DICOM_to_pixels(preview_points[j]),
+                                                                   preview_colour,
+                                                                   1.5f);
+                                }
+                            }
+                        }else if( (sketch_tool_mode == sketch_tool_mode_t::insert_vertex)
+                               && image_mouse_pos_opt.value().mouse_hovering_image
+                               && sketch_hovered_primitive ){
+                            imgs_window_draw_list->AddCircleFilled(image_mouse_pos_opt.value().DICOM_to_pixels(image_mouse_pos_opt.value().dicom_pos),
+                                                                   4.5f,
+                                                                   ImColor(1.00f, 0.55f, 0.15f, 1.00f));
+                        }
+
+                        if(sketch_show_vertex_numbers || sketch_show_primitive_numbers || sketch_show_constraint_numbers){
+                            const auto draw_sketch_label = [&](const vec3<double> &point,
+                                                                const ImColor &colour,
+                                                                const std::string &text,
+                                                                const ImVec2 &offset,
+                                                                bool highlighted = false) -> bool {
+                                const auto pixel_pos = image_mouse_pos_opt.value().DICOM_to_pixels(point);
+                                const auto text_extent = ImGui::CalcTextSize(text.c_str());
+                                const ImVec2 origin(pixel_pos.x + offset.x - text_extent.x * 0.5f,
+                                                    pixel_pos.y + offset.y - text_extent.y * 0.5f);
+                                const bool label_hovered = image_mouse_pos_opt.value().mouse_hovering_image
+                                                        && (io.MousePos.x >= origin.x)
+                                                        && (io.MousePos.x <= (origin.x + text_extent.x))
+                                                        && (io.MousePos.y >= origin.y)
+                                                        && (io.MousePos.y <= (origin.y + text_extent.y));
+                                const auto final_colour = (highlighted || label_hovered)
+                                                        ? ImColor(1.00f, 1.00f, 0.22f, 1.00f)
+                                                        : colour;
+                                imgs_window_draw_list->AddText(ImVec2(origin.x + 1.0f, origin.y + 1.0f),
+                                                                ImColor(0.0f, 0.0f, 0.0f, 0.85f),
+                                                                text.c_str());
+                                imgs_window_draw_list->AddText(origin, final_colour, text.c_str());
+                                return label_hovered;
+                            };
+
+                            // Keep vertex labels a single dedicated colour so they remain visually distinct from primitive
+                            // and constraint labels regardless of the parent primitive tag.
+                            const auto vertex_label_colour = ImColor(1.00f, 0.78f, 0.18f, 1.00f);
+                            const auto primitive_label_colour = ImColor(0.25f, 1.00f, 0.40f, 1.00f);
+                            const auto constraint_label_colour = ImColor(0.98f, 0.42f, 1.00f, 1.00f);
+
+                            if(sketch_show_vertex_numbers){
+                                for(std::size_t vertex_idx = 0U; vertex_idx < vertex_label_tags.size(); ++vertex_idx){
+                                    if(!vertex_label_tags.at(vertex_idx)) continue;
+                                    const bool label_hovered = draw_sketch_label(sketch.vertex(vertex_idx),
+                                                                                 vertex_label_colour,
+                                                                                 std::to_string(vertex_idx),
+                                                                                 ImVec2(10.0f, -10.0f),
+                                                                                 effective_hovered_vertex && (effective_hovered_vertex.value() == vertex_idx));
+                                    if(label_hovered){
+                                        sketch_hovered_vertex = vertex_idx;
+                                    }
+                                }
+                            }
+
+                            if(sketch_show_primitive_numbers){
+                                for(std::size_t primitive_idx = 0U; primitive_idx < primitive_label_positions.size(); ++primitive_idx){
+                                    const auto *primitive = sketch.primitive(primitive_idx);
+                                    if((primitive == nullptr) || !primitive_label_positions.at(primitive_idx)) continue;
+                                    const bool label_hovered = draw_sketch_label(primitive_label_positions.at(primitive_idx).value(),
+                                                                                 primitive_label_colour,
+                                                                                 std::to_string(primitive_idx),
+                                                                                 ImVec2(0.0f, -12.0f),
+                                                                                 effective_hovered_primitive && (effective_hovered_primitive.value() == primitive_idx));
+                                    if(label_hovered){
+                                        sketch_hovered_primitive = primitive_idx;
+                                    }
+                                }
+                            }
+
+                            if(sketch_show_constraint_numbers){
+                                for(std::size_t constraint_idx = 0U; constraint_idx < sketch.constraint_count(); ++constraint_idx){
+                                    const auto *constraint = sketch.constraint(constraint_idx);
+                                    if(constraint == nullptr) continue;
+
+                                    vec3<double> centre(0.0, 0.0, 0.0);
+                                    std::size_t count = 0U;
+                                    for(const auto primitive_idx : constraint->referenced_primitives()){
+                                        if(primitive_label_positions.size() <= primitive_idx) continue;
+                                        const auto *primitive = sketch.primitive(primitive_idx);
+                                        if((primitive == nullptr) || !primitive_label_positions.at(primitive_idx)) continue;
+                                        centre += primitive_label_positions.at(primitive_idx).value();
+                                        ++count;
+                                    }
+                                    for(const auto vertex_idx : constraint->referenced_vertices()){
+                                        if(sketch.vertex_count() <= vertex_idx) continue;
+                                        centre += sketch.vertex(vertex_idx);
+                                        ++count;
+                                    }
+                                    if(count == 0U) continue;
+                                    centre /= static_cast<double>(count);
+                                    if(constraint_idx < constraint_label_positions.size()){
+                                        constraint_label_positions.at(constraint_idx) = centre;
+                                    }
+                                    auto colour = constraint_label_colour;
+                                    if(!constraint->enabled){
+                                        colour.Value.w = 0.55f;
+                                    }
+                                    const bool label_hovered = draw_sketch_label(centre,
+                                                                                 colour,
+                                                                                 std::to_string(constraint_idx) + " " + sketch_constraint_indicator(constraint->kind()),
+                                                                                 ImVec2(0.0f, 12.0f),
+                                                                                 effective_hovered_constraint && (effective_hovered_constraint.value() == constraint_idx));
+                                    if(label_hovered){
+                                        sketch_hovered_constraint = constraint_idx;
                                     }
                                 }
                             }
                         }
                     }
 
-                    if( sketch_pending_primitive.active()
-                    &&  !sketch_pending_primitive.points.empty() ){
-                        auto preview_colour = sketch_tag_colour(sketch_pending_primitive.tag);
-                        std::vector<vec3<double>> preview_points = sketch_pending_primitive.points;
-                        if(image_mouse_pos.mouse_hovering_image){
-                            auto preview_point = image_mouse_pos.dicom_pos;
-                            if(io.KeyCtrl && sketch.has_plane() && !sketch_pending_primitive.points.empty()){
-                                const bool angular_snap = (sketch_pending_primitive.kind == Sketch::primitive_kind_t::line)
-                                                       || (sketch_pending_primitive.kind == Sketch::primitive_kind_t::circle)
-                                                       || (sketch_pending_primitive.kind == Sketch::primitive_kind_t::arc);
-                                if(angular_snap){
-                                    preview_point = sketch_snap_direction(sketch.plane(),
-                                                                         sketch_pending_primitive.points.front(),
-                                                                         preview_point);
-                                }
-                            }
-                            if(0.0 < sketch_snap_distance){
-                                if(const auto snapped_vertex = sketch.nearest_vertex(preview_point, sketch_snap_distance); snapped_vertex){
-                                    preview_point = sketch.vertex(snapped_vertex.value());
-                                }
-                            }
-                            preview_points.push_back(preview_point);
+                    if( sketch_drag_state.selection_box_active
+                    &&  sketch_drag_state.anchor
+                    &&  sketch_drag_state.last_pos ){
+                        const auto p0 = image_mouse_pos_opt.value().DICOM_to_pixels(sketch_drag_state.anchor.value());
+                        const auto p1 = image_mouse_pos_opt.value().DICOM_to_pixels(sketch_drag_state.last_pos.value());
+                        const ImVec2 ul(std::min(p0.x, p1.x), std::min(p0.y, p1.y));
+                        const ImVec2 lr(std::max(p0.x, p1.x), std::max(p0.y, p1.y));
+                        imgs_window_draw_list->AddRect(ul, lr, ImColor(1.0f, 1.0f, 0.2f, 1.0f));
+                    }
+                }else if(!view_toggles.view_vector_sketching_enabled){
+                    sketch_hovered_primitive = {};
+                    sketch_hovered_vertex = {};
+                    sketch_hovered_constraint = {};
+                }
+
+                ImGui::End();
+            }
+
+            const bool pressing_ctrl_Z = (io.KeyCtrl && ImGui::IsKeyPressed( SDL_SCANCODE_Z ));
+            const bool pressing_ctrl_Y = (io.KeyCtrl && ImGui::IsKeyPressed( SDL_SCANCODE_Y ));
+            const bool pressing_escape = ImGui::IsKeyPressed(SDL_SCANCODE_ESCAPE);
+            const bool pressing_delete = ImGui::IsKeyPressed(SDL_SCANCODE_DELETE);
+            if( image_mouse_pos_opt
+            &&  ( image_mouse_pos_opt.value().image_window_focused || image_mouse_pos_opt.value().image_window_hovered ) ){
+                if( view_toggles.view_vector_sketching_enabled
+                      &&  sketch_drag_state.anchor
+                      &&  (0 < IM_ARRAYSIZE(io.MouseDown))
+                      &&  !io.MouseDown[0] ){
+                    auto &slot = current_sketch_slot();
+                    if( sketch_drag_state.selection_box_active
+                    &&  sketch_drag_state.last_pos
+                    &&  slot.history.current().has_plane() ){
+                        const auto selected = slot.history.current().primitives_inside_box(sketch_drag_state.anchor.value(),
+                                                                                           sketch_drag_state.last_pos.value());
+                        if(!io.KeyCtrl){
+                            slot.clear_selection();
+                            slot.clear_vertex_selection();
                         }
-                        const auto preview_plane = sketch.has_plane()
-                                                ? std::optional<Sketch::plane_frame_t>(sketch.plane())
-                                                : try_get_current_sketch_plane(disp_img_it);
-                        const bool show_circle_hint = preview_plane
-                                                   && ((sketch_pending_primitive.kind == Sketch::primitive_kind_t::circle)
-                                                    || (sketch_pending_primitive.kind == Sketch::primitive_kind_t::arc))
-                                                   && (preview_points.size() == 2U);
-                        const bool show_arc_preview = preview_plane
-                                                   && (sketch_pending_primitive.kind == Sketch::primitive_kind_t::arc)
-                                                   && (preview_points.size() == 3U);
-                        for(const auto &p : preview_points){
-                            imgs_window_draw_list->AddCircleFilled(image_mouse_pos.DICOM_to_pixels(p), 3.5f, preview_colour);
-                        }
-                        if(show_circle_hint){
-                            const auto &centre = preview_points.front();
-                            const auto radius_point = preview_points.back();
-                            const auto radius = centre.distance(radius_point);
-                            if(std::numeric_limits<double>::epsilon() < radius){
-                                constexpr std::size_t segments = 48U;
-                                const auto radius_dir = radius_point - centre;
-                                const auto start_theta = std::atan2(radius_dir.Dot(preview_plane->col_unit),
-                                                                    radius_dir.Dot(preview_plane->row_unit));
-                                auto previous = radius_point;
-                                for(std::size_t j = 1U; j <= segments; ++j){
-                                    const auto theta = start_theta
-                                                     + (2.0 * std::acos(-1.0) * static_cast<double>(j)) / static_cast<double>(segments);
-                                    const auto next = centre
-                                                    + preview_plane->row_unit * (std::cos(theta) * radius)
-                                                    + preview_plane->col_unit * (std::sin(theta) * radius);
-                                    imgs_window_draw_list->AddLine(image_mouse_pos.DICOM_to_pixels(previous),
-                                                                   image_mouse_pos.DICOM_to_pixels(next),
-                                                                   preview_colour,
-                                                                   1.5f);
-                                    previous = next;
+                        slot.selection.insert(std::begin(selected), std::end(selected));
+                    }
+                    sketch_drag_state.clear();
+
+                }else if( view_toggles.view_vector_sketching_enabled
+                      &&  (pressing_ctrl_Z || pressing_ctrl_Y) ){
+                    auto &slot = current_sketch_slot();
+                    if(pressing_ctrl_Z){
+                        slot.history.undo();
+                    }else if(pressing_ctrl_Y){
+                        slot.history.redo();
+                    }
+                    slot.clear_selection();
+                    slot.clear_vertex_selection();
+                    clear_sketch_interaction_state();
+
+                }else if( view_toggles.view_vector_sketching_enabled
+                      &&  pressing_escape ){
+                    auto &slot = current_sketch_slot();
+                    if(sketch_pending_primitive.active() || (sketch_tool_mode != sketch_tool_mode_t::select)){
+                        sketch_pending_primitive.clear();
+                        sketch_tool_mode = sketch_tool_mode_t::select;
+                        sketch_drag_state.clear();
+                    }else{
+                        slot.clear_selection();
+                        slot.clear_vertex_selection();
+                        clear_sketch_interaction_state();
+                    }
+
+                }else if( view_toggles.view_vector_sketching_enabled
+                      &&  pressing_delete
+                      &&  !sketch_pending_primitive.active()
+                      &&  (sketch_tool_mode == sketch_tool_mode_t::select) ){
+                    auto &slot = current_sketch_slot();
+                    if(!slot.selection.empty() || !slot.vertex_selection.empty()){
+                        apply_sketch_edit(disp_img_it, [&](Sketch &editable_sketch){
+                            // Delete primitives first if any are selected.
+                            if(!slot.selection.empty()){
+                                // Collect indices into a sorted vector so we can delete
+                                // from highest index to lowest to avoid shifting.
+                                std::vector<Sketch::primitive_index_t> to_delete(
+                                    std::begin(slot.selection), std::end(slot.selection));
+                                std::sort(std::begin(to_delete), std::end(to_delete),
+                                          std::greater<Sketch::primitive_index_t>());
+                                for(const auto prim_idx : to_delete){
+                                    editable_sketch.delete_primitive(prim_idx);
                                 }
                             }
-                        }else if(show_arc_preview){
-                            const auto &centre = preview_points[0];
-                            const auto &start_point = preview_points[1];
-                            const auto &mouse_point = preview_points[2];
-                            const auto start_vec = start_point - centre;
-                            const auto start_u = start_vec.Dot(preview_plane->row_unit);
-                            const auto start_v = start_vec.Dot(preview_plane->col_unit);
-                            const auto radius = std::hypot(start_u, start_v);
-                            if(std::numeric_limits<double>::epsilon() < radius){
-                                const auto mouse_vec = mouse_point - centre;
-                                const auto mouse_u = mouse_vec.Dot(preview_plane->row_unit);
-                                const auto mouse_v = mouse_vec.Dot(preview_plane->col_unit);
-                                const auto start_angle = std::atan2(start_v, start_u);
-                                const auto mouse_angle = std::atan2(mouse_v, mouse_u);
-                                // Normalize both angles to [0, 2*pi) to match the behavior of
-                                // Sketch::normalize_angle() and the final arc rendering loop,
-                                // which always sweeps counterclockwise from start to stop.
-                                const auto pi = std::acos(-1.0);
-                                auto start_norm = start_angle;
-                                auto mouse_norm = mouse_angle;
-                                while(start_norm < 0.0) start_norm += 2.0 * pi;
-                                while((2.0 * pi) <= start_norm) start_norm -= 2.0 * pi;
-                                while(mouse_norm < 0.0) mouse_norm += 2.0 * pi;
-                                while((2.0 * pi) <= mouse_norm) mouse_norm -= 2.0 * pi;
-                                auto sweep = mouse_norm - start_norm;
-                                if(sweep <= 0.0) sweep += 2.0 * pi;
-                                constexpr std::size_t segments = 48U;
-                                auto previous = start_point;
-                                for(std::size_t j = 1U; j <= segments; ++j){
-                                    const auto theta = start_norm
-                                                     + (sweep * static_cast<double>(j)) / static_cast<double>(segments);
-                                    const auto next = centre
-                                                    + preview_plane->row_unit * (std::cos(theta) * radius)
-                                                    + preview_plane->col_unit * (std::sin(theta) * radius);
-                                    imgs_window_draw_list->AddLine(image_mouse_pos.DICOM_to_pixels(previous),
-                                                                   image_mouse_pos.DICOM_to_pixels(next),
-                                                                   preview_colour,
-                                                                   2.0f);
-                                    previous = next;
+                            // If vertices are selected, delete all primitives connected to them.
+                            if(!slot.vertex_selection.empty()){
+                                std::vector<Sketch::vertex_index_t> to_delete(
+                                    std::begin(slot.vertex_selection), std::end(slot.vertex_selection));
+                                // delete_vertex also deletes connected primitives and remaps
+                                // indices, so sort descending and iterate.
+                                std::sort(std::begin(to_delete), std::end(to_delete),
+                                          std::greater<Sketch::vertex_index_t>());
+                                for(const auto vtx_idx : to_delete){
+                                    editable_sketch.delete_vertex(vtx_idx);
+                                }
+                            }
+                        });
+                        slot.selection.clear();
+                        slot.clear_vertex_selection();
+                        sketch_last_unresolved_constraints = {};
+                        append_sketch_log("Deleted selected geometry");
+                    }
+
+                }else if( view_toggles.view_vector_sketching_enabled
+                      &&  (0 < IM_ARRAYSIZE(io.MouseDown))
+                      &&  (0.0f <= io.MouseDownDuration[0])
+                      &&  image_mouse_pos_opt.value().mouse_hovering_image ){
+                    auto &slot = current_sketch_slot();
+                    auto &sketch = slot.history.current();
+                    const auto mouse_pos = image_mouse_pos_opt.value().dicom_pos;
+                    const auto tol = sketch_canvas_selection_tolerance(image_mouse_pos_opt.value());
+                    const auto resolve_pending_point = [&](Sketch &editable_sketch,
+                                                           vec3<double> point) -> std::pair<vec3<double>, bool> {
+                        if(io.KeyCtrl && editable_sketch.has_plane() && !sketch_pending_primitive.points.empty()){
+                            const bool angular_snap = (sketch_pending_primitive.kind == Sketch::primitive_kind_t::line)
+                                                   || (sketch_pending_primitive.kind == Sketch::primitive_kind_t::circle)
+                                                   || (sketch_pending_primitive.kind == Sketch::primitive_kind_t::arc);
+                            if(angular_snap){
+                                point = sketch_snap_direction(editable_sketch.plane(),
+                                                             sketch_pending_primitive.points.front(),
+                                                             point);
+                            }
+                        }
+                        bool snapped_existing_vertex = false;
+                        if(0.0 < sketch_snap_distance){
+                            if(const auto snapped_vertex = editable_sketch.nearest_vertex(point, sketch_snap_distance); snapped_vertex){
+                                point = editable_sketch.vertex(snapped_vertex.value());
+                                snapped_existing_vertex = true;
+                            }
+                        }
+                        point = clamp_point_to_current_sketch_bounds(editable_sketch, point, disp_img_it);
+                        return std::make_pair(point, snapped_existing_vertex);
+                    };
+                    const auto resolve_vertex_index = [&](Sketch &editable_sketch,
+                                                          const vec3<double> &point) -> std::pair<Sketch::vertex_index_t, bool> {
+                        const auto clamped_point = clamp_point_to_current_sketch_bounds(editable_sketch, point, disp_img_it);
+                        if(0.0 < sketch_snap_distance){
+                            if(const auto snapped_vertex = editable_sketch.nearest_vertex(clamped_point, sketch_snap_distance); snapped_vertex){
+                                return std::make_pair(snapped_vertex.value(), true);
+                            }
+                        }
+                        return std::make_pair(editable_sketch.append_vertex(clamped_point), false);
+                    };
+
+                    if(0.0f == io.MouseDownDuration[0]){
+                        if(sketch_pending_primitive.active()){
+                            if(!ensure_sketch_plane(sketch, disp_img_it)){
+                                YLOGWARN("Current sketch belongs to a different image plane; reset or switch sketch slots before editing");
+                            }else{
+                                const auto resolved_point = resolve_pending_point(sketch, mouse_pos);
+                                sketch_pending_primitive.points.push_back(resolved_point.first);
+                                if(sketch_pending_primitive.points.size() == sketch_pending_primitive.required_points()){
+                                    auto &editable_sketch = create_sketch_snapshot(disp_img_it);
+                                    std::size_t primitive_idx = 0U;
+                                    bool stop_polyline = false;
+                                    switch(sketch_pending_primitive.kind.value()){
+                                        case Sketch::primitive_kind_t::vertex:
+                                            primitive_idx = editable_sketch.add_vertex_primitive(
+                                                resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(0)).first,
+                                                sketch_pending_primitive.tag);
+                                            break;
+                                        case Sketch::primitive_kind_t::line:
+                                            {
+                                                const auto start_vertex = resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(0));
+                                                const auto stop_vertex = resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(1));
+                                                primitive_idx = editable_sketch.add_line(start_vertex.first,
+                                                                                         stop_vertex.first,
+                                                                                         sketch_pending_primitive.tag);
+                                                // Snapping the new endpoint onto an existing vertex terminates
+                                                // polyline creation so the last segment closes onto that vertex.
+                                                stop_polyline = sketch_pending_primitive.polyline && stop_vertex.second;
+                                            }
+                                            break;
+                                        case Sketch::primitive_kind_t::circle:
+                                            primitive_idx = editable_sketch.add_circle(
+                                                resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(0)).first,
+                                                resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(1)).first,
+                                                sketch_pending_primitive.tag);
+                                            break;
+                                        case Sketch::primitive_kind_t::arc:
+                                            primitive_idx = editable_sketch.add_arc(
+                                                resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(0)).first,
+                                                resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(1)).first,
+                                                resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(2)).first,
+                                                sketch_pending_primitive.tag);
+                                            break;
+                                        case Sketch::primitive_kind_t::bezier:
+                                            primitive_idx = editable_sketch.add_bezier(
+                                                { resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(0)).first,
+                                                  resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(1)).first,
+                                                  resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(2)).first,
+                                                  resolve_vertex_index(editable_sketch, sketch_pending_primitive.points.at(3)).first },
+                                                sketch_pending_primitive.tag);
+                                            break;
+                                    }
+                                    solve_sketch_after_edit(editable_sketch, disp_img_it);
+                                    slot.selection = { primitive_idx };
+                                    slot.clear_vertex_selection();
+                                    if(sketch_pending_primitive.polyline && !stop_polyline){
+                                        sketch_pending_primitive.points = { sketch_pending_primitive.points.back() };
+                                        append_sketch_log("Pending: add " + sketch_pending_primitive.description() + " (1 click)");
+                                    }else{
+                                        sketch_pending_primitive.clear();
+                                    }
+                                }
+                            }
+                        }else if(sketch_tool_mode == sketch_tool_mode_t::insert_vertex){
+                            if(sketch.has_plane() && sketch_hovered_primitive){
+                                auto &editable_sketch = create_sketch_snapshot(disp_img_it);
+                                if(const auto inserted_vertex = editable_sketch.insert_vertex(sketch_hovered_primitive.value(), mouse_pos); inserted_vertex){
+                                    solve_sketch_after_edit(editable_sketch, disp_img_it);
+                                    slot.clear_selection();
+                                    slot.clear_vertex_selection();
+                                    slot.set_single_vertex_selection(inserted_vertex.value());
+                                    sketch_tool_mode = sketch_tool_mode_t::select;
+                                }
+                            }
+                        }else if(sketch_tool_mode == sketch_tool_mode_t::collapse_vertices){
+                            if(sketch_hovered_vertex){
+                                if(!io.KeyCtrl && slot.vertex_selection.empty()){
+                                    slot.clear_selection();
+                                }
+                                slot.select_vertex(sketch_hovered_vertex.value());
+                                if(slot.vertex_selection.size() == 2U){
+                                    const auto ordered_vertices = slot.ordered_selected_vertices();
+                                    const auto keep_vertex = ordered_vertices.front();
+                                    const auto remove_vertex = ordered_vertices.back();
+                                    auto &editable_sketch = create_sketch_snapshot(disp_img_it);
+                                    editable_sketch.collapse_vertices(keep_vertex, remove_vertex);
+                                    solve_sketch_after_edit(editable_sketch, disp_img_it);
+                                    slot.clear_selection();
+                                    slot.set_single_vertex_selection(keep_vertex);
+                                    sketch_tool_mode = sketch_tool_mode_t::select;
                                 }
                             }
                         }else{
-                            for(std::size_t j = 1U; j < preview_points.size(); ++j){
-                                imgs_window_draw_list->AddLine(image_mouse_pos.DICOM_to_pixels(preview_points[j - 1U]),
-                                                               image_mouse_pos.DICOM_to_pixels(preview_points[j]),
-                                                               preview_colour,
-                                                               1.5f);
+                            const auto hit_vertex = sketch.has_plane()
+                                                  ? sketch.nearest_primitive_vertex(mouse_pos, tol)
+                                                  : std::optional<std::pair<std::size_t, Sketch::vertex_index_t>>();
+                            const auto hit = hit_vertex
+                                           ? std::optional<std::size_t>(hit_vertex->first)
+                                           : (sketch.has_plane()
+                                                ? sketch.nearest_primitive(mouse_pos, tol)
+                                                : std::optional<std::size_t>());
+                            if(hit_vertex){
+                                if(slot.vertex_selected(hit_vertex->second)){
+                                    slot.deselect_vertex(hit_vertex->second);
+                                    sketch_drag_state.clear();
+                                }else{
+                                    if(!io.KeyCtrl){
+                                        slot.clear_selection();
+                                        slot.clear_vertex_selection();
+                                    }
+                                    slot.select_vertex(hit_vertex->second);
+                                    sketch_drag_state.selection_move_active = true;
+                                    sketch_drag_state.selection_box_active = false;
+                                    sketch_drag_state.snapshot_created = false;
+                                    sketch_drag_state.anchor = mouse_pos;
+                                    sketch_drag_state.last_pos = mouse_pos;
+                                    sketch_drag_state.dragged_vertex = hit_vertex->second;
+                                }
+                            }else if(hit){
+                                if(slot.primitive_selected(hit.value())){
+                                    slot.selection.erase(hit.value());
+                                    sketch_drag_state.clear();
+                                }else{
+                                    if(!io.KeyCtrl){
+                                        slot.clear_selection();
+                                        slot.clear_vertex_selection();
+                                    }
+                                    slot.selection.insert(hit.value());
+                                    sketch_drag_state.selection_move_active = true;
+                                    sketch_drag_state.selection_box_active = false;
+                                    sketch_drag_state.snapshot_created = false;
+                                    sketch_drag_state.anchor = mouse_pos;
+                                    sketch_drag_state.last_pos = mouse_pos;
+                                    sketch_drag_state.dragged_vertex = sketch.nearest_vertex(mouse_pos, tol, slot.selection);
+                                }
+                            }else{
+                                if(!io.KeyCtrl){
+                                    slot.clear_selection();
+                                    slot.clear_vertex_selection();
+                                }
+                                sketch_drag_state.selection_box_active = true;
+                                sketch_drag_state.selection_move_active = false;
+                                sketch_drag_state.snapshot_created = false;
+                                sketch_drag_state.dragged_vertex = {};
+                                sketch_drag_state.anchor = mouse_pos;
+                                sketch_drag_state.last_pos = mouse_pos;
                             }
                         }
-                    }else if( (sketch_tool_mode == sketch_tool_mode_t::insert_vertex)
-                           && image_mouse_pos.mouse_hovering_image
-                           && sketch_hovered_primitive ){
-                        imgs_window_draw_list->AddCircleFilled(image_mouse_pos.DICOM_to_pixels(image_mouse_pos.dicom_pos),
-                                                               4.5f,
-                                                               ImColor(1.00f, 0.55f, 0.15f, 1.00f));
-                    }
+                    }else{
+                        const auto previous_pos = sketch_drag_state.last_pos.value_or(mouse_pos);
+                        sketch_drag_state.last_pos = mouse_pos;
+                        const auto moved_far_enough = sketch_drag_state.anchor
+                                                   && (sketch_drag_state.anchor.value().distance(mouse_pos) > (tol * 0.25));
 
-                    if(sketch_show_vertex_numbers || sketch_show_primitive_numbers || sketch_show_constraint_numbers){
-                        const auto draw_sketch_label = [&](const vec3<double> &point,
-                                                            const ImColor &colour,
-                                                            const std::string &text,
-                                                            const ImVec2 &offset,
-                                                            bool highlighted = false) -> bool {
-                            const auto pixel_pos = image_mouse_pos.DICOM_to_pixels(point);
-                            const auto text_extent = ImGui::CalcTextSize(text.c_str());
-                            const ImVec2 origin(pixel_pos.x + offset.x - text_extent.x * 0.5f,
-                                                pixel_pos.y + offset.y - text_extent.y * 0.5f);
-                            const bool label_hovered = image_mouse_pos.mouse_hovering_image
-                                                    && (io.MousePos.x >= origin.x)
-                                                    && (io.MousePos.x <= (origin.x + text_extent.x))
-                                                    && (io.MousePos.y >= origin.y)
-                                                    && (io.MousePos.y <= (origin.y + text_extent.y));
-                            const auto final_colour = (highlighted || label_hovered)
-                                                    ? ImColor(1.00f, 1.00f, 0.22f, 1.00f)
-                                                    : colour;
-                            imgs_window_draw_list->AddText(ImVec2(origin.x + 1.0f, origin.y + 1.0f),
-                                                            ImColor(0.0f, 0.0f, 0.0f, 0.85f),
-                                                            text.c_str());
-                            imgs_window_draw_list->AddText(origin, final_colour, text.c_str());
-                            return label_hovered;
-                        };
-
-                        // Keep vertex labels a single dedicated colour so they remain visually distinct from primitive
-                        // and constraint labels regardless of the parent primitive tag.
-                        const auto vertex_label_colour = ImColor(1.00f, 0.78f, 0.18f, 1.00f);
-                        const auto primitive_label_colour = ImColor(0.25f, 1.00f, 0.40f, 1.00f);
-                        const auto constraint_label_colour = ImColor(0.98f, 0.42f, 1.00f, 1.00f);
-
-                        if(sketch_show_vertex_numbers){
-                            for(std::size_t vertex_idx = 0U; vertex_idx < vertex_label_tags.size(); ++vertex_idx){
-                                if(!vertex_label_tags.at(vertex_idx)) continue;
-                                const bool label_hovered = draw_sketch_label(sketch.vertex(vertex_idx),
-                                                                             vertex_label_colour,
-                                                                             std::to_string(vertex_idx),
-                                                                             ImVec2(10.0f, -10.0f),
-                                                                             effective_hovered_vertex && (effective_hovered_vertex.value() == vertex_idx));
-                                if(label_hovered){
-                                    sketch_hovered_vertex = vertex_idx;
-                                }
+                        if( sketch_drag_state.selection_move_active
+                        &&  moved_far_enough
+                        &&  sketch.has_plane()
+                        &&  (sketch_drag_state.dragged_vertex || !slot.selection.empty()) ){
+                            if(!sketch_drag_state.snapshot_created){
+                                create_sketch_snapshot(disp_img_it);
+                                sketch_drag_state.snapshot_created = true;
                             }
-                        }
-
-                        if(sketch_show_primitive_numbers){
-                            for(std::size_t primitive_idx = 0U; primitive_idx < primitive_label_positions.size(); ++primitive_idx){
-                                const auto *primitive = sketch.primitive(primitive_idx);
-                                if((primitive == nullptr) || !primitive_label_positions.at(primitive_idx)) continue;
-                                const bool label_hovered = draw_sketch_label(primitive_label_positions.at(primitive_idx).value(),
-                                                                             primitive_label_colour,
-                                                                             std::to_string(primitive_idx),
-                                                                             ImVec2(0.0f, -12.0f),
-                                                                             effective_hovered_primitive && (effective_hovered_primitive.value() == primitive_idx));
-                                if(label_hovered){
-                                    sketch_hovered_primitive = primitive_idx;
-                                }
+                            auto &editable_sketch = slot.history.current();
+                            if(sketch_drag_state.dragged_vertex){
+                                editable_sketch.set_vertex(sketch_drag_state.dragged_vertex.value(), mouse_pos);
+                            }else{
+                                editable_sketch.translate_vertices(editable_sketch.collect_vertices(slot.selection),
+                                                                   mouse_pos - previous_pos);
                             }
-                        }
-
-                        if(sketch_show_constraint_numbers){
-                            for(std::size_t constraint_idx = 0U; constraint_idx < sketch.constraint_count(); ++constraint_idx){
-                                const auto *constraint = sketch.constraint(constraint_idx);
-                                if(constraint == nullptr) continue;
-
-                                vec3<double> centre(0.0, 0.0, 0.0);
-                                std::size_t count = 0U;
-                                for(const auto primitive_idx : constraint->referenced_primitives()){
-                                    if(primitive_label_positions.size() <= primitive_idx) continue;
-                                    const auto *primitive = sketch.primitive(primitive_idx);
-                                    if((primitive == nullptr) || !primitive_label_positions.at(primitive_idx)) continue;
-                                    centre += primitive_label_positions.at(primitive_idx).value();
-                                    ++count;
-                                }
-                                for(const auto vertex_idx : constraint->referenced_vertices()){
-                                    if(sketch.vertex_count() <= vertex_idx) continue;
-                                    centre += sketch.vertex(vertex_idx);
-                                    ++count;
-                                }
-                                if(count == 0U) continue;
-                                centre /= static_cast<double>(count);
-                                if(constraint_idx < constraint_label_positions.size()){
-                                    constraint_label_positions.at(constraint_idx) = centre;
-                                }
-                                auto colour = constraint_label_colour;
-                                if(!constraint->enabled){
-                                    colour.Value.w = 0.55f;
-                                }
-                                const bool label_hovered = draw_sketch_label(centre,
-                                                                             colour,
-                                                                             std::to_string(constraint_idx) + " " + sketch_constraint_indicator(constraint->kind()),
-                                                                             ImVec2(0.0f, 12.0f),
-                                                                             effective_hovered_constraint && (effective_hovered_constraint.value() == constraint_idx));
-                                if(label_hovered){
-                                    sketch_hovered_constraint = constraint_idx;
-                                }
-                            }
+                            solve_sketch_after_edit(editable_sketch, disp_img_it);
                         }
                     }
                 }
-
-                if( sketch_drag_state.selection_box_active
-                &&  sketch_drag_state.anchor
-                &&  sketch_drag_state.last_pos ){
-                    const auto p0 = image_mouse_pos.DICOM_to_pixels(sketch_drag_state.anchor.value());
-                    const auto p1 = image_mouse_pos.DICOM_to_pixels(sketch_drag_state.last_pos.value());
-                    const ImVec2 ul(std::min(p0.x, p1.x), std::min(p0.y, p1.y));
-                    const ImVec2 lr(std::max(p0.x, p1.x), std::max(p0.y, p1.y));
-                    imgs_window_draw_list->AddRect(ul, lr, ImColor(1.0f, 1.0f, 0.2f, 1.0f));
-                }
-            }else if(!view_toggles.view_vector_sketching_enabled){
-                sketch_hovered_primitive = {};
-                sketch_hovered_vertex = {};
-                sketch_hovered_constraint = {};
             }
 
             if(view_toggles.view_vector_sketching_enabled){
@@ -6593,7 +8062,7 @@ bool SDL_Viewer(Drover &DICOM_data,
 
                 int new_sketch_slot_num = sketch_slot_num;
                 const int max_sketch_slot_num = std::max<int>(static_cast<int>(sketch_slots.size()) - 1, 0);
-                if(ImGui::SliderInt("Sketch", &new_sketch_slot_num, 0, max_sketch_slot_num)){
+                if(ImGui::SliderInt("Sketch Number", &new_sketch_slot_num, 0, max_sketch_slot_num)){
                     sketch_slot_num = new_sketch_slot_num;
                     ensure_sketch_slots(static_cast<std::size_t>(std::max(sketch_slot_num, 0)));
                     clear_sketch_interaction_state();
@@ -6633,10 +8102,49 @@ bool SDL_Viewer(Drover &DICOM_data,
 
                 auto &slot = current_sketch_slot();
                 auto &sketch = slot.history.current();
-                const bool sketch_compatible = sketch_is_compatible_with_image(sketch, disp_img_it);
-                if(!sketch_compatible){
+                const bool sketch_compatible = sketch_matches_display_image(sketch);
+                if(sketch.has_plane() && (disp_img_it != disp_img_it_t()) && !sketch_compatible){
                     ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
                                        "This sketch belongs to a different image plane.");
+                }
+                ImGui::SetNextItemOpen(true, ImGuiCond_FirstUseEver);
+                if(ImGui::CollapsingHeader("Adopt Geometry")){
+                    ImGui::Checkbox("Add image boundary as support geometry", &sketch_add_image_boundary_on_plane_adopt);
+                    if(ImGui::Button("Adopt Image Plane")){
+                        if(sketch_image_geometry){
+                            std::vector<std::vector<vec3<double>>> support_loops;
+                            if(sketch_add_image_boundary_on_plane_adopt){
+                                support_loops.emplace_back(sketch_image_geometry->boundary);
+                            }
+                            adopt_sketch_plane(sketch_image_geometry->plane,
+                                               support_loops,
+                                               disp_img_it,
+                                               "Adopted the current display image plane");
+                        }else{
+                            append_sketch_log("Unable to adopt image plane: no active image plane is available");
+                        }
+                    }
+                    ImGui::Checkbox("Add hovered face support geometry", &sketch_mesh_face_adoption.include_face_geometry);
+                    ImGui::Checkbox("Add coplanar mesh support geometry", &sketch_mesh_face_adoption.include_coplanar_geometry);
+                    ImGui::SetNextItemWidth(140.0f);
+                    ImGui::InputDouble("Coplanar eps (mm)", &sketch_mesh_face_adoption.coplanar_eps, 0.1, 1.0, "%.3f");
+                    sketch_mesh_face_adoption.coplanar_eps = std::max(0.0, sketch_mesh_face_adoption.coplanar_eps);
+                    if(sketch_mesh_face_adoption.active){
+                        if(ImGui::Button("Cancel Adopt Mesh Face Plane")){
+                            sketch_mesh_face_adoption.active = false;
+                            sketch_mesh_face_adoption.hovered_plane = {};
+                            sketch_mesh_face_adoption.hovered_face_vertices.clear();
+                            sketch_mesh_face_adoption.hovered_coplanar_faces.clear();
+                            sketch_mesh_face_adoption.hovered_rectangle_visible = false;
+                        }
+                        ImGui::TextWrapped("Hover a mesh face in the Meshes viewport and click to adopt its tangent plane.");
+                    }else if(ImGui::Button("Adopt Mesh Face Plane")){
+                        sketch_mesh_face_adoption.active = true;
+                        sketch_mesh_face_adoption.hovered_plane = {};
+                        sketch_mesh_face_adoption.hovered_face_vertices.clear();
+                        sketch_mesh_face_adoption.hovered_coplanar_faces.clear();
+                        sketch_mesh_face_adoption.hovered_rectangle_visible = false;
+                    }
                 }
 
                 if(ImGui::Button("Save")){
@@ -7286,69 +8794,66 @@ bool SDL_Viewer(Drover &DICOM_data,
                     sketch_extrude_max_discretization_error = std::max(0.001, sketch_extrude_max_discretization_error);
                     ImGui::Checkbox("Export debug cap meshes", &sketch_export_extrusion_caps);
                     if(ImGui::Button("Extrude")){
-                        if(disp_img_it == disp_img_it_t()){
-                            sketch_file_status = "Cannot insert surface mesh: no active image available for metadata";
-                        }else{
-                            try{
-                                const auto append_surface_mesh = [&](fv_surface_mesh<double, uint64_t> &&surface_mesh,
-                                                                     const std::string &mesh_label,
-                                                                     const std::string &description) -> void {
-                                    auto mesh_metadata = coalesce_metadata_for_basic_mesh(disp_img_it->metadata, meta_evolve::iterate);
-                                    surface_mesh.metadata = std::move(mesh_metadata);
-                                    surface_mesh.metadata["MeshLabel"] = mesh_label;
-                                    surface_mesh.metadata["NormalizedMeshLabel"] = mesh_label;
-                                    surface_mesh.metadata["Description"] = description;
-                                    DICOM_data.smesh_data.emplace_back(std::make_shared<Surface_Mesh>());
-                                    DICOM_data.smesh_data.back()->meshes = std::move(surface_mesh);
-                                };
+                        try{
+                            const auto append_surface_mesh = [&](fv_surface_mesh<double, uint64_t> &&surface_mesh,
+                                                                 const std::string &mesh_label,
+                                                                 const std::string &description) -> void {
+                                metadata_map_t mesh_metadata = (disp_img_it == disp_img_it_t()) ? metadata_map_t() : disp_img_it->metadata;
+                                mesh_metadata = coalesce_metadata_for_basic_mesh(mesh_metadata, meta_evolve::iterate);
+                                surface_mesh.metadata = std::move(mesh_metadata);
+                                surface_mesh.metadata["MeshLabel"] = mesh_label;
+                                surface_mesh.metadata["NormalizedMeshLabel"] = mesh_label;
+                                surface_mesh.metadata["Description"] = description;
+                                DICOM_data.smesh_data.emplace_back(std::make_shared<Surface_Mesh>());
+                                DICOM_data.smesh_data.back()->meshes = std::move(surface_mesh);
+                            };
 
-                                auto extrude_sketch = slot.history.current();
-                                // Remove support primitives and unreferenced vertices before extruding.
-                                for(std::size_t i = 0; i < extrude_sketch.primitive_count(); ){
-                                    if(extrude_sketch.primitive(i)->tag == Sketch::geometry_tag_t::support){
-                                        extrude_sketch.delete_primitive(i);
-                                    }else{
-                                        ++i;
-                                    }
-                                }
-                                extrude_sketch.delete_unreferenced_vertices();
-
-                                Sketch::extrusion_options_t extrusion_options;
-                                extrusion_options.into_frame_length = sketch_extrude_into_frame;
-                                extrusion_options.out_of_frame_length = sketch_extrude_out_of_frame;
-                                extrusion_options.into_frame_angle_degrees = sketch_extrude_into_frame_angle;
-                                extrusion_options.out_of_frame_angle_degrees = sketch_extrude_out_of_frame_angle;
-                                extrusion_options.max_discretization_error = sketch_extrude_max_discretization_error;
-                                fv_surface_mesh<double, uint64_t> extruded_mesh;
-                                std::vector<fv_surface_mesh<double, uint64_t>> cap_meshes;
-                                std::string error_message;
-                                const auto mesh_label = "Sketch Extrusion " + std::to_string(sketch_slot_num);
-                                if(extrude_sketch.build_extruded_surface_mesh(extrusion_options,
-                                                                                     extruded_mesh,
-                                                                                     sketch_export_extrusion_caps ? &cap_meshes : nullptr,
-                                                                                     &error_message)){
-                                    append_surface_mesh(std::move(extruded_mesh),
-                                                        mesh_label,
-                                                        "Extruded vector sketch surface mesh");
-                                    if(sketch_export_extrusion_caps){
-                                        for(std::size_t i = 0U; i < cap_meshes.size(); ++i){
-                                            const auto cap_label = mesh_label + ((i == 0U) ? " Near Cap" : " Far Cap");
-                                            append_surface_mesh(std::move(cap_meshes.at(i)),
-                                                                cap_label,
-                                                                "Extruded vector sketch debug cap surface mesh");
-                                        }
-                                    }
-                                    sketch_file_status = "Inserted a surface mesh from sketch slot " + std::to_string(sketch_slot_num);
+                            auto extrude_sketch = slot.history.current();
+                            // Remove support primitives and unreferenced vertices before extruding.
+                            for(std::size_t i = 0; i < extrude_sketch.primitive_count(); ){
+                                if(extrude_sketch.primitive(i)->tag == Sketch::geometry_tag_t::support){
+                                    extrude_sketch.delete_primitive(i);
                                 }else{
-                                    sketch_file_status = error_message;
+                                    ++i;
                                 }
-                            }catch(const std::exception &e){
-                                YLOGWARN("Sketch extrusion UI handler caught exception: '" << e.what() << "'");
-                                sketch_file_status = std::string("Sketch extrusion failed: ") + e.what();
-                            }catch(...){
-                                YLOGWARN("Sketch extrusion UI handler caught an unknown exception");
-                                sketch_file_status = "Sketch extrusion failed with an unknown exception";
                             }
+                            extrude_sketch.delete_unreferenced_vertices();
+
+                            Sketch::extrusion_options_t extrusion_options;
+                            extrusion_options.into_frame_length = sketch_extrude_into_frame;
+                            extrusion_options.out_of_frame_length = sketch_extrude_out_of_frame;
+                            extrusion_options.into_frame_angle_degrees = sketch_extrude_into_frame_angle;
+                            extrusion_options.out_of_frame_angle_degrees = sketch_extrude_out_of_frame_angle;
+                            extrusion_options.max_discretization_error = sketch_extrude_max_discretization_error;
+                            fv_surface_mesh<double, uint64_t> extruded_mesh;
+                            std::vector<fv_surface_mesh<double, uint64_t>> cap_meshes;
+                            std::string error_message;
+                            const auto mesh_label = "Sketch Extrusion " + std::to_string(sketch_slot_num);
+                            if(extrude_sketch.build_extruded_surface_mesh(extrusion_options,
+                                                                                 extruded_mesh,
+                                                                                 sketch_export_extrusion_caps ? &cap_meshes : nullptr,
+                                                                                 &error_message)){
+                                append_surface_mesh(std::move(extruded_mesh),
+                                                    mesh_label,
+                                                    "Extruded vector sketch surface mesh");
+                                if(sketch_export_extrusion_caps){
+                                    for(std::size_t i = 0U; i < cap_meshes.size(); ++i){
+                                        const auto cap_label = mesh_label + ((i == 0U) ? " Near Cap" : " Far Cap");
+                                        append_surface_mesh(std::move(cap_meshes.at(i)),
+                                                            cap_label,
+                                                            "Extruded vector sketch debug cap surface mesh");
+                                    }
+                                }
+                                sketch_file_status = "Inserted a surface mesh from sketch slot " + std::to_string(sketch_slot_num);
+                            }else{
+                                sketch_file_status = error_message;
+                            }
+                        }catch(const std::exception &e){
+                            YLOGWARN("Sketch extrusion UI handler caught exception: '" << e.what() << "'");
+                            sketch_file_status = std::string("Sketch extrusion failed: ") + e.what();
+                        }catch(...){
+                            YLOGWARN("Sketch extrusion UI handler caught an unknown exception");
+                            sketch_file_status = "Sketch extrusion failed with an unknown exception";
                         }
                         append_sketch_log(sketch_file_status);
                     }
@@ -7370,1448 +8875,527 @@ bool SDL_Viewer(Drover &DICOM_data,
                     }
                 }
 
-                if(view_sketch_editor_enabled){
-                    ImGui::SetNextWindowSize(ImVec2(980.0f, 620.0f), ImGuiCond_FirstUseEver);
-                    ImGui::SetNextWindowPos(ImVec2(720.0f, 120.0f), ImGuiCond_FirstUseEver);
-                    ImGui::Begin("Sketch Editor", &view_sketch_editor_enabled, ImGuiWindowFlags_AlwaysAutoResize);
-                    const auto to_tag_index = [](Sketch::geometry_tag_t tag) -> int {
-                        return (tag == Sketch::geometry_tag_t::support) ? 1 : 0;
-                    };
-                    const auto to_tag_value = [](int tag_idx) -> Sketch::geometry_tag_t {
-                        return (tag_idx == 1) ? Sketch::geometry_tag_t::support : Sketch::geometry_tag_t::normal;
-                    };
-                    const auto kind_to_string = [](Sketch::primitive_kind_t kind) -> const char* {
-                        switch(kind){
-                            case Sketch::primitive_kind_t::vertex: return "vertex";
-                            case Sketch::primitive_kind_t::line:   return "line";
-                            case Sketch::primitive_kind_t::circle: return "circle";
-                            case Sketch::primitive_kind_t::arc:    return "arc";
-                            case Sketch::primitive_kind_t::bezier: return "bezier";
-                        }
-                        return "unknown";
-                    };
-                    const auto edit_current_sketch = [&](auto &&fn) -> void {
-                        apply_sketch_edit(disp_img_it, [&](Sketch &editable_sketch){
-                            fn(editable_sketch);
-                        });
-                        slot.clear_selection();
-                        slot.clear_vertex_selection();
-                        clear_sketch_interaction_state();
-                    };
-                    auto next_editor_hovered_primitive = std::optional<std::size_t>{};
-                    auto next_editor_hovered_vertex = std::optional<Sketch::vertex_index_t>{};
-                    auto next_editor_hovered_constraint = std::optional<std::size_t>{};
-
-                    ImGui::Text("Editable sketch state");
-                    ImGui::Checkbox("Show vertex numbers", &sketch_show_vertex_numbers);
-                    ImGui::SameLine();
-                    ImGui::Checkbox("Show primitive numbers", &sketch_show_primitive_numbers);
-                    ImGui::SameLine();
-                    ImGui::Checkbox("Show constraint numbers", &sketch_show_constraint_numbers);
-                    ImGui::Separator();
-                    if(ImGui::Button("Delete all vertices")){
-                        edit_current_sketch([](Sketch &editable_sketch){
-                            editable_sketch.clear_vertices();
-                        });
-                    }
-                    ImGui::SameLine();
-                    if(ImGui::Button("Delete all primitives")){
-                        edit_current_sketch([](Sketch &editable_sketch){
-                            editable_sketch.clear_primitives();
-                        });
-                    }
-                    ImGui::SameLine();
-                    if(ImGui::Button("Delete all constraints")){
-                        edit_current_sketch([](Sketch &editable_sketch){
-                            editable_sketch.clear_constraints();
-                        });
-                    }
-                    ImGui::SameLine();
-                    if(ImGui::Button("Delete all un-referenced vertices")){
-                        edit_current_sketch([&](Sketch &editable_sketch){
-                            const auto removed = editable_sketch.delete_unreferenced_vertices();
-                            sketch_file_status = "Deleted " + std::to_string(removed) + " unreferenced " + ((removed == 1U) ? "vertex" : "vertices");
-                        });
-                    }
-                    ImGui::SameLine();
-                    if(ImGui::Button("Reset Sketch")){
-                        edit_current_sketch([](Sketch &editable_sketch){
-                            editable_sketch.clear();
-                        });
-                    }
-
-                    if(ImGui::BeginChild("##sketch_debug_state", ImVec2(950.0f, 520.0f), true)){
-                        const auto clamp_debug_index = [](int idx, std::size_t count) -> std::size_t {
-                            if(count == 0U) return 0U;
-                            return static_cast<std::size_t>(std::clamp(idx, 0, static_cast<int>(count - 1U)));
-                        };
-
-                        ImGui::Separator();
-                        ImGui::Text("Vertices");
-                        for(std::size_t vertex_idx = 0U; vertex_idx < slot.history.current().vertex_count(); ++vertex_idx){
-                            const auto v = slot.history.current().vertex(vertex_idx);
-                            ImGui::PushID(static_cast<int>(vertex_idx));
-                            ImGui::Text("Vertex %zu", vertex_idx);
-                            if(ImGui::IsItemHovered()){
-                                next_editor_hovered_vertex = vertex_idx;
-                            }
-                            ImGui::SameLine();
-                            double x = v.x;
-                            double y = v.y;
-                            double z = v.z;
-                            bool changed = false;
-                            ImGui::SetNextItemWidth(100.0f);
-                            changed = ImGui::InputDouble("x", &x) || changed;
-                            ImGui::SameLine();
-                            ImGui::SetNextItemWidth(100.0f);
-                            changed = ImGui::InputDouble("y", &y) || changed;
-                            ImGui::SameLine();
-                            ImGui::SetNextItemWidth(100.0f);
-                            changed = ImGui::InputDouble("z", &z) || changed;
-                            ImGui::SameLine();
-                            const bool delete_vertex_clicked = ImGui::Button("Delete##vertex");
-                            ImGui::PopID();
-
-                            if(changed){
-                                edit_current_sketch([&](Sketch &editable_sketch){
-                                    editable_sketch.set_vertex(vertex_idx, vec3<double>(x, y, z));
-                                });
-                                break;
-                            }
-                            if(delete_vertex_clicked){
-                                edit_current_sketch([&](Sketch &editable_sketch){
-                                    editable_sketch.delete_vertex(vertex_idx);
-                                });
-                                break;
-                            }
-                        }
-
-                        ImGui::Separator();
-                        ImGui::Text("Primitives");
-                        for(std::size_t primitive_idx = 0U; primitive_idx < slot.history.current().primitive_count(); ++primitive_idx){
-                            const auto *primitive = slot.history.current().primitive(primitive_idx);
-                            if(primitive == nullptr) continue;
-
-                            const auto vertex_count = slot.history.current().vertex_count();
-
-                            ImGui::PushID(static_cast<int>(primitive_idx));
-                            ImGui::Text("Primitive %zu (%s)", primitive_idx, kind_to_string(primitive->kind()));
-                            if(ImGui::IsItemHovered()){
-                                next_editor_hovered_primitive = primitive_idx;
-                            }
-                            int tag_idx = to_tag_index(primitive->tag);
-                            ImGui::SetNextItemWidth(140.0f);
-                            const bool tag_changed = ImGui::Combo("Tag", &tag_idx, "normal\0support\0");
-                            ImGui::SameLine();
-                            const bool delete_primitive_clicked = ImGui::Button("Delete##primitive");
-
-                            if(tag_changed){
-                                edit_current_sketch([&](Sketch &editable_sketch){
-                                    if(auto *editable_primitive = editable_sketch.primitive(primitive_idx); editable_primitive != nullptr){
-                                        editable_primitive->tag = to_tag_value(tag_idx);
-                                    }
-                                });
-                                ImGui::PopID();
-                                break;
-                            }
-                            if(delete_primitive_clicked){
-                                edit_current_sketch([&](Sketch &editable_sketch){
-                                    editable_sketch.delete_primitive(primitive_idx);
-                                });
-                                ImGui::PopID();
-                                break;
-                            }
-
-                            bool primitive_changed = false;
-                            if(const auto *vertex_primitive = dynamic_cast<const Sketch::vertex_primitive_t*>(primitive); vertex_primitive != nullptr){
-                                int vertex_ref = static_cast<int>(vertex_primitive->vertex);
-                                ImGui::SetNextItemWidth(120.0f);
-                                primitive_changed = ImGui::InputInt("Vertex Index", &vertex_ref);
-                                if(primitive_changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_primitive = dynamic_cast<Sketch::vertex_primitive_t*>(editable_sketch.primitive(primitive_idx)); editable_primitive != nullptr){
-                                            editable_primitive->vertex = clamp_debug_index(vertex_ref, vertex_count);
-                                            editable_sketch.refresh_geometry();
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *line = dynamic_cast<const Sketch::line_primitive_t*>(primitive); line != nullptr){
-                                int v0 = static_cast<int>(line->vertices[0]);
-                                int v1 = static_cast<int>(line->vertices[1]);
-                                ImGui::SetNextItemWidth(120.0f);
-                                primitive_changed = ImGui::InputInt("Start Vertex", &v0);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(120.0f);
-                                primitive_changed = ImGui::InputInt("Stop Vertex", &v1) || primitive_changed;
-                                if(primitive_changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_primitive = dynamic_cast<Sketch::line_primitive_t*>(editable_sketch.primitive(primitive_idx)); editable_primitive != nullptr){
-                                            editable_primitive->vertices[0] = clamp_debug_index(v0, vertex_count);
-                                            editable_primitive->vertices[1] = clamp_debug_index(v1, vertex_count);
-                                            editable_sketch.refresh_geometry();
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *circle = dynamic_cast<const Sketch::circle_primitive_t*>(primitive); circle != nullptr){
-                                int center_idx = static_cast<int>(circle->center);
-                                int radius_idx = static_cast<int>(circle->radius_point);
-                                double radius = circle->radius;
-                                ImGui::SetNextItemWidth(110.0f);
-                                primitive_changed = ImGui::InputInt("Center Vertex", &center_idx);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(110.0f);
-                                primitive_changed = ImGui::InputInt("Radius Vertex", &radius_idx) || primitive_changed;
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(110.0f);
-                                primitive_changed = ImGui::InputDouble("Radius", &radius) || primitive_changed;
-                                if(primitive_changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_primitive = dynamic_cast<Sketch::circle_primitive_t*>(editable_sketch.primitive(primitive_idx)); editable_primitive != nullptr){
-                                            editable_primitive->center = clamp_debug_index(center_idx, vertex_count);
-                                            editable_primitive->radius_point = clamp_debug_index(radius_idx, vertex_count);
-                                            const auto centre = editable_sketch.vertex(editable_primitive->center);
-                                            auto dir = editable_sketch.vertex(editable_primitive->radius_point) - centre;
-                                            if(dir.sq_length() <= std::numeric_limits<double>::epsilon()){
-                                                dir = editable_sketch.plane().row_unit;
-                                            }
-                                            editable_sketch.vertex(editable_primitive->radius_point) = centre + dir.unit() * std::max(radius, 0.0);
-                                            editable_sketch.refresh_geometry();
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(primitive); arc != nullptr){
-                                int center_idx = static_cast<int>(arc->center);
-                                int start_idx = static_cast<int>(arc->start);
-                                int stop_idx = static_cast<int>(arc->stop);
-                                double radius = arc->radius;
-                                double start_angle = arc->start_angle;
-                                double stop_angle = arc->stop_angle;
-                                ImGui::SetNextItemWidth(95.0f);
-                                primitive_changed = ImGui::InputInt("Center", &center_idx);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(95.0f);
-                                primitive_changed = ImGui::InputInt("Start", &start_idx) || primitive_changed;
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(95.0f);
-                                primitive_changed = ImGui::InputInt("Stop", &stop_idx) || primitive_changed;
-                                ImGui::SetNextItemWidth(100.0f);
-                                primitive_changed = ImGui::InputDouble("Radius", &radius) || primitive_changed;
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(100.0f);
-                                primitive_changed = ImGui::InputDouble("Start Angle", &start_angle) || primitive_changed;
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(100.0f);
-                                primitive_changed = ImGui::InputDouble("Stop Angle", &stop_angle) || primitive_changed;
-                                if(primitive_changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_primitive = dynamic_cast<Sketch::arc_primitive_t*>(editable_sketch.primitive(primitive_idx)); editable_primitive != nullptr){
-                                            editable_primitive->center = clamp_debug_index(center_idx, vertex_count);
-                                            editable_primitive->start = clamp_debug_index(start_idx, vertex_count);
-                                            editable_primitive->stop = clamp_debug_index(stop_idx, vertex_count);
-                                            const auto centre = editable_sketch.vertex(editable_primitive->center);
-                                            const auto r = std::max(radius, 0.0);
-                                            const auto &plane = editable_sketch.plane();
-                                            editable_sketch.vertex(editable_primitive->start) = centre + plane.row_unit * (std::cos(start_angle) * r)
-                                                                                                      + plane.col_unit * (std::sin(start_angle) * r);
-                                            editable_sketch.vertex(editable_primitive->stop) = centre + plane.row_unit * (std::cos(stop_angle) * r)
-                                                                                                     + plane.col_unit * (std::sin(stop_angle) * r);
-                                            editable_sketch.refresh_geometry();
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *bezier = dynamic_cast<const Sketch::bezier_primitive_t*>(primitive); bezier != nullptr){
-                                int v0 = static_cast<int>(bezier->control_vertices[0]);
-                                int v1 = static_cast<int>(bezier->control_vertices[1]);
-                                int v2 = static_cast<int>(bezier->control_vertices[2]);
-                                int v3 = static_cast<int>(bezier->control_vertices[3]);
-                                ImGui::SetNextItemWidth(90.0f);
-                                primitive_changed = ImGui::InputInt("P0", &v0);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(90.0f);
-                                primitive_changed = ImGui::InputInt("P1", &v1) || primitive_changed;
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(90.0f);
-                                primitive_changed = ImGui::InputInt("P2", &v2) || primitive_changed;
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(90.0f);
-                                primitive_changed = ImGui::InputInt("P3", &v3) || primitive_changed;
-                                if(primitive_changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_primitive = dynamic_cast<Sketch::bezier_primitive_t*>(editable_sketch.primitive(primitive_idx)); editable_primitive != nullptr){
-                                            editable_primitive->control_vertices[0] = clamp_debug_index(v0, vertex_count);
-                                            editable_primitive->control_vertices[1] = clamp_debug_index(v1, vertex_count);
-                                            editable_primitive->control_vertices[2] = clamp_debug_index(v2, vertex_count);
-                                            editable_primitive->control_vertices[3] = clamp_debug_index(v3, vertex_count);
-                                            editable_sketch.refresh_geometry();
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }
-                            ImGui::PopID();
-                        }
-
-                        ImGui::Separator();
-                        ImGui::Text("Constraints");
-                        for(std::size_t constraint_idx = 0U; constraint_idx < slot.history.current().constraint_count(); ++constraint_idx){
-                            const auto *constraint = slot.history.current().constraint(constraint_idx);
-                            if(constraint == nullptr) continue;
-
-                            const auto primitive_count = slot.history.current().primitive_count();
-                            const auto vertex_count = slot.history.current().vertex_count();
-
-                            ImGui::PushID(static_cast<int>(constraint_idx));
-                            ImGui::Text("Constraint %zu (%s)", constraint_idx, slot.history.current().describe_constraint(constraint_idx).c_str());
-                            if(ImGui::IsItemHovered()){
-                                next_editor_hovered_constraint = constraint_idx;
-                            }
-                            bool enabled = constraint->enabled;
-                            bool changed = ImGui::Checkbox("Enabled", &enabled);
-                            ImGui::SameLine();
-                            const bool delete_constraint_clicked = ImGui::Button("Delete##constraint");
-                            if(changed){
-                                edit_current_sketch([&](Sketch &editable_sketch){
-                                    if(auto *editable_constraint = editable_sketch.constraint(constraint_idx); editable_constraint != nullptr){
-                                        editable_constraint->enabled = enabled;
-                                    }
-                                });
-                                ImGui::PopID();
-                                break;
-                            }
-                            if(delete_constraint_clicked){
-                                edit_current_sketch([&](Sketch &editable_sketch){
-                                    editable_sketch.delete_constraint(constraint_idx);
-                                });
-                                ImGui::PopID();
-                                break;
-                            }
-
-                            if(const auto *horizontal = dynamic_cast<const Sketch::horizontal_constraint_t*>(constraint); horizontal != nullptr){
-                                int line_idx = static_cast<int>(horizontal->line);
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Line", &line_idx);
-                                if(changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_constraint = dynamic_cast<Sketch::horizontal_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
-                                            editable_constraint->line = clamp_debug_index(line_idx, primitive_count);
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *vertical = dynamic_cast<const Sketch::vertical_constraint_t*>(constraint); vertical != nullptr){
-                                int line_idx = static_cast<int>(vertical->line);
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Line", &line_idx);
-                                if(changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_constraint = dynamic_cast<Sketch::vertical_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
-                                            editable_constraint->line = clamp_debug_index(line_idx, primitive_count);
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *distance = dynamic_cast<const Sketch::distance_constraint_t*>(constraint); distance != nullptr){
-                                int primitive_idx = static_cast<int>(distance->primitive);
-                                double target_distance = distance->target_distance;
-                                const char *target_label = "Target Distance";
-                                if(const auto *distance_primitive = slot.history.current().primitive(distance->primitive); distance_primitive != nullptr){
-                                    if(distance_primitive->kind() == Sketch::primitive_kind_t::line){
-                                        target_label = "Length";
-                                    }else if((distance_primitive->kind() == Sketch::primitive_kind_t::circle)
-                                          || (distance_primitive->kind() == Sketch::primitive_kind_t::arc)){
-                                        target_label = "Radius";
-                                    }
-                                }
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Primitive", &primitive_idx);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(120.0f);
-                                changed = ImGui::InputDouble(target_label, &target_distance) || changed;
-                                if(changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_constraint = dynamic_cast<Sketch::distance_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
-                                            editable_constraint->primitive = clamp_debug_index(primitive_idx, primitive_count);
-                                            editable_constraint->target_distance = target_distance;
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *parallel = dynamic_cast<const Sketch::parallel_constraint_t*>(constraint); parallel != nullptr){
-                                int line_a = static_cast<int>(parallel->line_a);
-                                int line_b = static_cast<int>(parallel->line_b);
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Line A", &line_a);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Line B", &line_b) || changed;
-                                if(changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_constraint = dynamic_cast<Sketch::parallel_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
-                                            editable_constraint->line_a = clamp_debug_index(line_a, primitive_count);
-                                            editable_constraint->line_b = clamp_debug_index(line_b, primitive_count);
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *perpendicular = dynamic_cast<const Sketch::perpendicular_constraint_t*>(constraint); perpendicular != nullptr){
-                                int line_a = static_cast<int>(perpendicular->line_a);
-                                int line_b = static_cast<int>(perpendicular->line_b);
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Line A", &line_a);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Line B", &line_b) || changed;
-                                if(changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_constraint = dynamic_cast<Sketch::perpendicular_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
-                                            editable_constraint->line_a = clamp_debug_index(line_a, primitive_count);
-                                            editable_constraint->line_b = clamp_debug_index(line_b, primitive_count);
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *pin = dynamic_cast<const Sketch::pin_constraint_t*>(constraint); pin != nullptr){
-                                int vertex_idx = static_cast<int>(pin->vertex);
-                                double x = pin->pinned_position.x;
-                                double y = pin->pinned_position.y;
-                                double z = pin->pinned_position.z;
-                                ImGui::SetNextItemWidth(100.0f);
-                                changed = ImGui::InputInt("Vertex", &vertex_idx);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(100.0f);
-                                changed = ImGui::InputDouble("Pin X", &x) || changed;
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(100.0f);
-                                changed = ImGui::InputDouble("Pin Y", &y) || changed;
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(100.0f);
-                                changed = ImGui::InputDouble("Pin Z", &z) || changed;
-                                if(changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_constraint = dynamic_cast<Sketch::pin_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
-                                            editable_constraint->vertex = clamp_debug_index(vertex_idx, vertex_count);
-                                            editable_constraint->pinned_position = vec3<double>(x, y, z);
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *tangent = dynamic_cast<const Sketch::tangent_constraint_t*>(constraint); tangent != nullptr){
-                                int primitive_a = static_cast<int>(tangent->primitive_a);
-                                int primitive_b = static_cast<int>(tangent->primitive_b);
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Primitive A", &primitive_a);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Primitive B", &primitive_b) || changed;
-                                if(changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_constraint = dynamic_cast<Sketch::tangent_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
-                                            editable_constraint->primitive_a = clamp_debug_index(primitive_a, primitive_count);
-                                            editable_constraint->primitive_b = clamp_debug_index(primitive_b, primitive_count);
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *mirror = dynamic_cast<const Sketch::mirror_constraint_t*>(constraint); mirror != nullptr){
-                                int line_idx = static_cast<int>(mirror->line);
-                                int vertex_a = static_cast<int>(mirror->vertex_a);
-                                int vertex_b = static_cast<int>(mirror->vertex_b);
-                                ImGui::SetNextItemWidth(100.0f);
-                                changed = ImGui::InputInt("Line", &line_idx);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(100.0f);
-                                changed = ImGui::InputInt("Vertex A", &vertex_a) || changed;
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(100.0f);
-                                changed = ImGui::InputInt("Vertex B", &vertex_b) || changed;
-                                if(changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_constraint = dynamic_cast<Sketch::mirror_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
-                                            editable_constraint->line = clamp_debug_index(line_idx, primitive_count);
-                                            editable_constraint->vertex_a = clamp_debug_index(vertex_a, vertex_count);
-                                            editable_constraint->vertex_b = clamp_debug_index(vertex_b, vertex_count);
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }else if(const auto *overlap = dynamic_cast<const Sketch::overlap_constraint_t*>(constraint); overlap != nullptr){
-                                int vertex_a = static_cast<int>(overlap->vertex_a);
-                                int vertex_b = static_cast<int>(overlap->vertex_b);
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Vertex A", &vertex_a);
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(110.0f);
-                                changed = ImGui::InputInt("Vertex B", &vertex_b) || changed;
-                                if(changed){
-                                    edit_current_sketch([&](Sketch &editable_sketch){
-                                        if(auto *editable_constraint = dynamic_cast<Sketch::overlap_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
-                                            editable_constraint->vertex_a = clamp_debug_index(vertex_a, vertex_count);
-                                            editable_constraint->vertex_b = clamp_debug_index(vertex_b, vertex_count);
-                                        }
-                                    });
-                                    ImGui::PopID();
-                                    break;
-                                }
-                            }
-                            ImGui::PopID();
-                        }
-                    }
-                    sketch_editor_hovered_primitive = next_editor_hovered_primitive;
-                    sketch_editor_hovered_vertex = next_editor_hovered_vertex;
-                    sketch_editor_hovered_constraint = next_editor_hovered_constraint;
-                    ImGui::EndChild();
-                    ImGui::End();
-                }else{
-                    sketch_editor_hovered_primitive = {};
-                    sketch_editor_hovered_vertex = {};
-                    sketch_editor_hovered_constraint = {};
-                }
                 ImGui::End();
             }
 
-            // Contouring and drawing interface.
-            if( view_toggles.view_contouring_enabled
-            ||  view_toggles.view_drawing_enabled ){
-                // Provide a visual cue for the contouring brush.
-                if(image_mouse_pos.mouse_hovering_image){
-                    const auto pixel_radius = static_cast<float>(contouring_reach) * image_mouse_pos.pixel_scale;
-                    const auto c = ImColor(0.0f, 1.0f, 0.8f, 1.0f);
-
-                    if( (contouring_brush == brush_t::rigid_circle)
-                    ||  (contouring_brush == brush_t::rigid_sphere)
-                    ||  (contouring_brush == brush_t::gaussian_2D)
-                    ||  (contouring_brush == brush_t::tanh_2D)
-                    ||  (contouring_brush == brush_t::gaussian_3D)
-                    ||  (contouring_brush == brush_t::tanh_3D)
-                    ||  (contouring_brush == brush_t::median_circle)
-                    ||  (contouring_brush == brush_t::mean_circle)
-                    ||  (contouring_brush == brush_t::median_sphere)
-                    ||  (contouring_brush == brush_t::mean_sphere) ){
-                        imgs_window_draw_list->AddCircle(io.MousePos, pixel_radius, c);
-
-                    }else if( (contouring_brush == brush_t::rigid_square)
-                          ||  (contouring_brush == brush_t::median_square)
-                          ||  (contouring_brush == brush_t::mean_square)
-                          ||  (contouring_brush == brush_t::rigid_cube)
-                          ||  (contouring_brush == brush_t::median_cube)
-                          ||  (contouring_brush == brush_t::mean_cube) ){
-                        ImVec2 ul( io.MousePos.x - pixel_radius,
-                                   io.MousePos.y - pixel_radius );
-                        ImVec2 lr( io.MousePos.x + pixel_radius,
-                                   io.MousePos.y + pixel_radius );
-                        imgs_window_draw_list->AddRect(ul, lr, c);
+            if(view_sketch_editor_enabled){
+                ImGui::SetNextWindowSize(ImVec2(980.0f, 620.0f), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowPos(ImVec2(720.0f, 120.0f), ImGuiCond_FirstUseEver);
+                ImGui::Begin("Sketch Editor", &view_sketch_editor_enabled, ImGuiWindowFlags_AlwaysAutoResize);
+                const auto to_tag_index = [](Sketch::geometry_tag_t tag) -> int {
+                    return (tag == Sketch::geometry_tag_t::support) ? 1 : 0;
+                };
+                const auto to_tag_value = [](int tag_idx) -> Sketch::geometry_tag_t {
+                    return (tag_idx == 1) ? Sketch::geometry_tag_t::support : Sketch::geometry_tag_t::normal;
+                };
+                const auto kind_to_string = [](Sketch::primitive_kind_t kind) -> const char* {
+                    switch(kind){
+                        case Sketch::primitive_kind_t::vertex: return "vertex";
+                        case Sketch::primitive_kind_t::line:   return "line";
+                        case Sketch::primitive_kind_t::circle: return "circle";
+                        case Sketch::primitive_kind_t::arc:    return "arc";
+                        case Sketch::primitive_kind_t::bezier: return "bezier";
                     }
+                    return "unknown";
+                };
+                const auto edit_current_sketch = [&](auto &&fn) -> void {
+                    apply_sketch_edit(disp_img_it, [&](Sketch &editable_sketch){
+                        fn(editable_sketch);
+                    });
+                    slot.clear_selection();
+                    slot.clear_vertex_selection();
+                    clear_sketch_interaction_state();
+                };
+                auto next_editor_hovered_primitive = std::optional<std::size_t>{};
+                auto next_editor_hovered_vertex = std::optional<Sketch::vertex_index_t>{};
+                auto next_editor_hovered_constraint = std::optional<std::size_t>{};
+
+                ImGui::Text("Editable sketch state");
+                ImGui::Checkbox("Show vertex numbers", &sketch_show_vertex_numbers);
+                ImGui::SameLine();
+                ImGui::Checkbox("Show primitive numbers", &sketch_show_primitive_numbers);
+                ImGui::SameLine();
+                ImGui::Checkbox("Show constraint numbers", &sketch_show_constraint_numbers);
+                ImGui::Separator();
+                if(ImGui::Button("Delete all vertices")){
+                    edit_current_sketch([](Sketch &editable_sketch){
+                        editable_sketch.clear_vertices();
+                    });
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Delete all primitives")){
+                    edit_current_sketch([](Sketch &editable_sketch){
+                        editable_sketch.clear_primitives();
+                    });
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Delete all constraints")){
+                    edit_current_sketch([](Sketch &editable_sketch){
+                        editable_sketch.clear_constraints();
+                    });
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Delete all un-referenced vertices")){
+                    edit_current_sketch([&](Sketch &editable_sketch){
+                        const auto removed = editable_sketch.delete_unreferenced_vertices();
+                        sketch_file_status = "Deleted " + std::to_string(removed) + " unreferenced " + ((removed == 1U) ? "vertex" : "vertices");
+                    });
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Reset Sketch")){
+                    edit_current_sketch([](Sketch &editable_sketch){
+                        editable_sketch.clear();
+                    });
                 }
 
-                ImGui::SetNextWindowSize(ImVec2(510, 650), ImGuiCond_FirstUseEver);
-                ImGui::SetNextWindowPos(ImVec2(680, 400), ImGuiCond_FirstUseEver);
-                //ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
-                if(view_toggles.view_drawing_enabled){
-                    ImGui::Begin("Drawing", &view_toggles.view_drawing_enabled, ImGuiWindowFlags_AlwaysAutoResize);
-                    ImGui::Text("Note: this functionality is still under active development.");
+                if(ImGui::BeginChild("##sketch_debug_state", ImVec2(950.0f, 520.0f), true)){
+                    const auto clamp_debug_index = [](int idx, std::size_t count) -> std::size_t {
+                        if(count == 0U) return 0U;
+                        return static_cast<std::size_t>(std::clamp(idx, 0, static_cast<int>(count - 1U)));
+                    };
 
-                }else if(view_toggles.view_contouring_enabled){
-                    ImGui::Begin("Contouring", &view_toggles.view_contouring_enabled, ImGuiWindowFlags_AlwaysAutoResize);
-                    ImGui::Text("Note: this functionality is still under active development.");
-                    if(ImGui::Button("Save")){ 
-                        ImGui::OpenPopup("Save Contours");
-                        contour_extraction_underway += 1;
-
-                        // Launch a thread to extract contours.
-                        const auto worker = [&extract_contours,
-                                             &extracted_contours_mutex,
-                                             &extracted_contours,
-                                             &contour_extraction_underway,
-                                             l_cdrover = cdrover_ptr->Deep_Copy(),
-                                             contouring_method ](){
-                            try{
-                                YLOGINFO("Starting contour extraction");
-                                auto out = extract_contours(l_cdrover, contouring_method);
-                                YLOGINFO("Completed contour extraction; waiting on lock");
-
-                                std::unique_lock<std::shared_timed_mutex> ec_lock(extracted_contours_mutex);
-                                extracted_contours = out;
-                            }catch(const std::exception &e){
-                                YLOGWARN("Contour extraction failed: '" << e.what() << "'");
-
-                                std::unique_lock<std::shared_timed_mutex> ec_lock(extracted_contours_mutex);
-                                extracted_contours = {};
-                            }
-
-                            contour_extraction_underway -= 1;
-                            return;
-                        };
-                        wq.submit_task( worker ); // Offload to waiting worker thread.
-                    }
-                    ImGui::SameLine();
-                    if(ImGui::BeginPopupModal("Save Contours", NULL, ImGuiWindowFlags_AlwaysAutoResize)){
-                        const std::string dots((frame_count / 15) % 4, '.'); // Simplistic animation.
-                        ImGui::Text("Saving contours%s", dots.c_str());
-
-                        ImGui::InputText("ROI Name", new_contour_name.data(), new_contour_name.size());
-                        std::string entered_text;
-                        array_to_string(entered_text, new_contour_name);
-
-                        ImGui::Checkbox("Overwrite existing contours", &overwrite_existing_contours);
-
-                        // Check if the contouring task is complete. We assume that the work is done and the results
-                        // have replaced the original contouring Drover object if there are no available contours.
-                        const bool work_is_done = (contour_extraction_underway.load() == 0L);
-                        if(work_is_done){
-                            std::unique_lock<std::shared_timed_mutex> lock(extracted_contours_mutex,
-                                                                           std::chrono::microseconds(50));
-                            if( lock
-                            && extracted_contours){
-                                *cdrover_ptr = extracted_contours.value();
-                                extracted_contours = {};
-                            }
-                        }else{
-                            ImGui::TextDisabled("Waiting for contour extraction%s", dots.c_str());
+                    ImGui::Separator();
+                    ImGui::Text("Vertices");
+                    for(std::size_t vertex_idx = 0U; vertex_idx < slot.history.current().vertex_count(); ++vertex_idx){
+                        const auto v = slot.history.current().vertex(vertex_idx);
+                        ImGui::PushID(static_cast<int>(vertex_idx));
+                        ImGui::Text("Vertex %zu", vertex_idx);
+                        if(ImGui::IsItemHovered()){
+                            next_editor_hovered_vertex = vertex_idx;
                         }
-
-                        bool roiname_is_valid = !entered_text.empty();
-                        if(!roiname_is_valid){
-                            ImGui::TextDisabled("Please enter a name to proceed.");
-                        }
-                        if(roiname_is_valid && !overwrite_existing_contours){
-                            DICOM_data.Ensure_Contour_Data_Allocated();
-                            roiname_is_valid = ( std::find_if( std::begin(DICOM_data.contour_data->ccs),
-                                                         std::end(DICOM_data.contour_data->ccs),
-                                                         [entered_text](const contour_collection<double> &cc) -> bool {
-                                                             const auto l_roi_name = cc.get_dominant_value_for_key("ROIName").value_or("unspecified");
-                                                             return (l_roi_name == entered_text);
-                                                         }) == std::end(DICOM_data.contour_data->ccs) );
-                            if(!roiname_is_valid){
-                                ImGui::TextDisabled("Found existing contour with the given name.");
-                            }
-                        }
-
-                        const bool save_possible = roiname_is_valid && work_is_done;
-                        ImGui::BeginDisabled(!save_possible);
-                        const bool clicked_save = ImGui::Button("Save");
-                        ImGui::EndDisabled();
-
-                        if( clicked_save
-                        &&  save_possible
-                        &&  save_contour_buffer(entered_text) ){
-                            string_to_array(new_contour_name, "");
-                            ImGui::CloseCurrentPopup();
-                        }
-
                         ImGui::SameLine();
-                        if(ImGui::Button("Cancel")){
-                            ImGui::CloseCurrentPopup();
-                            // Detaching here would be nice, but not currently available for std::shared_future AFAICT.
-                            // Otherwise, we have to wait for the task to complete. Maybe transfer to yet another thread
-                            // and detach the thread?? TODO.
-                            extracted_contours = decltype(extracted_contours)();
-                            contouring_img_altered = true;
-                        }
-                        ImGui::EndPopup();
-                    }
-
-                    DICOM_data.Ensure_Contour_Data_Allocated();
-                    if( ImGui::Button("Edit Existing")
-                    &&  !DICOM_data.contour_data->ccs.empty() ){ 
-                        edit_existing_contour_selection = std::begin(DICOM_data.contour_data->ccs);
-
-                        ImGui::OpenPopup("Edit Existing Contours");
-                    }
-                    if(ImGui::BeginPopupModal("Edit Existing Contours", NULL, ImGuiWindowFlags_AlwaysAutoResize)){
-                        DICOM_data.Ensure_Contour_Data_Allocated();
-
-                        const auto beg = std::begin(DICOM_data.contour_data->ccs);
-                        const auto end = std::end(DICOM_data.contour_data->ccs);
-                        bool valid_roi_selected = false;
-                        
-                        if(ImGui::BeginListBox("Contours")){
-                            for(auto it = beg; it != end; ++it){
-                                const auto l_roi_name = it->get_dominant_value_for_key("ROIName").value_or("unspecified");
-                                const bool is_selected =  edit_existing_contour_selection
-                                                       && (edit_existing_contour_selection.value() == it);
-                                if(is_selected) valid_roi_selected = true;
-                                ImGui::PushID(static_cast<void*>(std::addressof(*it)));
-                                if(ImGui::Selectable(l_roi_name.data(), is_selected)){
-                                    edit_existing_contour_selection = it;
-                                }
-                                ImGui::PopID();
-                                if(is_selected) ImGui::SetItemDefaultFocus(); // Used for keyboard navigation.
-                            }
-                            ImGui::EndListBox();
-                        }
-
-                        if(ImGui::BeginListBox("Overlap Handling")){
-                            for(size_t i = 0UL; i < contour_overlap_styles.size(); ++i){
-                                const bool is_selected = (i == contour_overlap_style);
-                                ImGui::PushID(i);
-                                if(ImGui::Selectable(contour_overlap_styles[i].data(), is_selected)){
-                                    contour_overlap_style = i;
-                                }
-                                ImGui::PopID();
-                                if(is_selected) ImGui::SetItemDefaultFocus(); // Used for keyboard navigation.
-                            }
-                            ImGui::EndListBox();
-                        }
-
-                        const bool clicked_copy = ImGui::Button("Copy");
-                        if( clicked_copy
-                        &&  valid_roi_selected
-                        &&  edit_existing_contour_selection ){
-
-                            // Copy the selected contours to a shuttle. We use double-buffering here in case there are
-                            // any existing contours.
-                            decltype(cdrover_ptr->contour_data->ccs) shtl;
-                            shtl.emplace_back();
-                            for(const auto& c : edit_existing_contour_selection.value()->contours){
-                                shtl.back().contours.push_back( c );
-                            }
-                            auto cm = shtl.back().get_common_metadata({}, {});
-
-                            // Make snapshot of the current state.
-                            cdrover_ptr = create_cdrover_snapshot(contouring_drover_cache, cdrover_ptr);
-
-                            std::list<OperationArgPkg> Operations;
-                            const bool op_load_res = Load_Standard_Script( Operations, "plumbing", "copy existing contours" );
-                            if(!op_load_res) throw std::runtime_error("Unable to load script");
-                            metadata_map_t l_InvocationMetadata;
-                            contour_overlap_style = std::clamp<size_t>(contour_overlap_style, static_cast<size_t>(0UL), contour_overlap_styles.size());
-                            l_InvocationMetadata["contour_overlap_method"] = contour_overlap_styles[contour_overlap_style];
-
-                            cdrover_ptr->Ensure_Contour_Data_Allocated();
-                            cdrover_ptr->contour_data->ccs.swap(shtl);
-                            const bool res = Operation_Dispatcher(*cdrover_ptr, l_InvocationMetadata, FilenameLex, Operations);
-                            cdrover_ptr->Ensure_Contour_Data_Allocated();
-                            cdrover_ptr->contour_data->ccs.swap(shtl);
-                            
-                            contouring_img_altered = true;
-                            if(res){
-                                edit_existing_contour_selection = {};
-                                ImGui::CloseCurrentPopup();
-                            }else{
-                                YLOGWARN("Copying failed");
-                            }
-                        }
-
+                        double x = v.x;
+                        double y = v.y;
+                        double z = v.z;
+                        bool changed = false;
+                        ImGui::SetNextItemWidth(100.0f);
+                        changed = ImGui::InputDouble("x", &x) || changed;
                         ImGui::SameLine();
-                        if(ImGui::Button("Cancel")){
-                            ImGui::CloseCurrentPopup();
-                        }
-                        ImGui::EndPopup();
-                    }
-                }
+                        ImGui::SetNextItemWidth(100.0f);
+                        changed = ImGui::InputDouble("y", &y) || changed;
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(100.0f);
+                        changed = ImGui::InputDouble("z", &z) || changed;
+                        ImGui::SameLine();
+                        const bool delete_vertex_clicked = ImGui::Button("Delete##vertex");
+                        ImGui::PopID();
 
-                // Undo and redo manual control.
-                if( view_toggles.view_contouring_enabled ){
-                    const auto v_list = contouring_drover_cache.get_versions();
-                    const auto v_curr = contouring_drover_cache.get_version(cdrover_ptr);
-                    int pos = 0;
-                    for(const auto &v : v_list){
-                        if(v == v_curr){
+                        if(changed){
+                            edit_current_sketch([&](Sketch &editable_sketch){
+                                editable_sketch.set_vertex(vertex_idx, vec3<double>(x, y, z));
+                            });
                             break;
-                        }else{
-                            ++pos;
                         }
-                    }
-
-                    const auto N_versions = static_cast<int>(v_list.size());
-                    ImGui::SliderInt("History", &pos, 0, N_versions - 1);
-                    if( ImGui::IsItemHovered() ){
-                        ImGui::BeginTooltip();
-                        ImGui::Text("Note: hot keys [ctrl]+[z] and [ctrl]+[y] are supported.");
-                        ImGui::EndTooltip();
-                    }
-                    const auto new_pos = std::clamp<int>(pos, 0, N_versions - 1);
-                    const auto v_new = *(std::next( std::begin(v_list), new_pos ));
-                    if(v_new != v_curr){
-                        auto l_cdrover_ptr = contouring_drover_cache.get(v_new);
-                        cdrover_ptr = (l_cdrover_ptr == nullptr) ? cdrover_ptr : l_cdrover_ptr;
-
-                        contouring_img_altered = true;
-                    }
-
-                    if(ImGui::Checkbox("Show contours from adjacent slices", &contouring_show_adjacent)){
-                        contouring_img_altered = true;
+                        if(delete_vertex_clicked){
+                            edit_current_sketch([&](Sketch &editable_sketch){
+                                editable_sketch.delete_vertex(vertex_idx);
+                            });
+                            break;
+                        }
                     }
 
                     ImGui::Separator();
-                }
+                    ImGui::Text("Primitives");
+                    for(std::size_t primitive_idx = 0U; primitive_idx < slot.history.current().primitive_count(); ++primitive_idx){
+                        const auto *primitive = slot.history.current().primitive(primitive_idx);
+                        if(primitive == nullptr) continue;
 
-                ImGui::Text("Brush");
-                ImGui::DragFloat("Radius (mm)", &contouring_reach, 0.1f, 0.5f, 50.0f);
-                if(view_toggles.view_drawing_enabled){
-                    ImGui::DragFloat("Intensity", &contouring_intensity, 0.1f, -1000.0f, 1000.0f);
-                }else if(view_toggles.view_contouring_enabled){
-                    contouring_intensity = 1.0f;
-                }
+                        const auto vertex_count = slot.history.current().vertex_count();
 
-                ImGui::Text("2D shapes");
-                if(ImGui::Button("Rigid Circle")){
-                    contouring_brush = brush_t::rigid_circle;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A fast brush that is not smoothed.\n"
-                                "Produces jagged brush strokes and contours.\n"
-                                "This brush has no dynamics.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("Mean Circle")){
-                    contouring_brush = brush_t::mean_circle;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A brush that averages voxel intensities.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("Median Circle")){
-                    contouring_brush = brush_t::median_circle;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A brush that applies a median filter to voxel intensities.");
-                    ImGui::EndTooltip();
-                }
-
-                if(ImGui::Button("Rigid Square")){
-                    contouring_brush = brush_t::rigid_square;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A fast brush that is not smoothed.\n"
-                                "Produces jagged brush strokes and contours.\n"
-                                "This brush has no dynamics.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("Mean Square")){
-                    contouring_brush = brush_t::mean_square;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A brush that averages voxel intensities.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("Median Square")){
-                    contouring_brush = brush_t::median_square;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A brush that applies a median filter to voxel intensities.");
-                    ImGui::EndTooltip();
-                }
-
-                if(ImGui::Button("2D Gaussian")){
-                    contouring_brush = brush_t::gaussian_2D;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("Provides a smooth brush with strong dynamic effect.\n"
-                                "This brush is somewhat slow because the Gaussian distribution extends\n"
-                                "relatively far outwards into adjacent voxels.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("2D Tanh")){
-                    contouring_brush = brush_t::tanh_2D;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("Provides geometrically-accurate contours and sweeps with minimal dynamics.\n"
-                                "This brush is also economical compared to the rigid brush,\n"
-                                "requiring lower mask resolution to achieve a smooth contour.");
-                    ImGui::EndTooltip();
-                }
-
-                ImGui::Text("3D shapes");
-                if(ImGui::Button("Rigid Sphere")){
-                    contouring_brush = brush_t::rigid_sphere;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A fast brush that is not smoothed.\n"
-                                "Produces jagged brush strokes and contours.\n"
-                                "This brush has no dynamics.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("Mean Sphere")){
-                    contouring_brush = brush_t::mean_sphere;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A brush that averages voxel intensities.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("Median Sphere")){
-                    contouring_brush = brush_t::median_sphere;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A brush that applies a median filter to voxel intensities.");
-                    ImGui::EndTooltip();
-                }
-
-                if(ImGui::Button("Rigid Cube")){
-                    contouring_brush = brush_t::rigid_cube;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A fast brush that is not smoothed.\n"
-                                "Produces jagged brush strokes and contours.\n"
-                                "This brush has no dynamics.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("Mean Cube")){
-                    contouring_brush = brush_t::mean_cube;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A brush that averages voxel intensities.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("Median Cube")){
-                    contouring_brush = brush_t::median_cube;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("A brush that applies a median filter to voxel intensities.");
-                    ImGui::EndTooltip();
-                }
-
-                if(ImGui::Button("3D Gaussian")){
-                    contouring_brush = brush_t::gaussian_3D;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("Provides a smooth brush with strong dynamic effect.\n"
-                                "This brush is somewhat slow because the Gaussian distribution extends\n"
-                                "relatively far outwards into adjacent voxels.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("3D Tanh")){
-                    contouring_brush = brush_t::tanh_3D;
-                }
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("Provides geometrically-accurate contours and sweeps with minimal dynamics.\n"
-                                "This brush is also economical compared to the rigid brush,\n"
-                                "requiring lower mask resolution to achieve a smooth contour.");
-                    ImGui::EndTooltip();
-                }
-
-                ImGui::Separator();
-                ImGui::Text("Dilation and Erosion");
-                ImGui::DragFloat("Margin (mm)", &contouring_margin, 0.1f, -10.0f, 10.0f);
-                if(ImGui::Button("Apply Margin")){
-
-                    // Make snapshot of the current state.
-                    if( view_toggles.view_contouring_enabled ){
-                        cdrover_ptr = create_cdrover_snapshot(contouring_drover_cache, cdrover_ptr);
-                    }
-
-                    std::list<OperationArgPkg> Operations;
-                    const bool op_load_res = Load_Standard_Script( Operations, "plumbing", "dilate erode margin" );
-                    if(!op_load_res) throw std::runtime_error("Unable to load script");
-                    metadata_map_t l_InvocationMetadata;
-                    contour_overlap_style = std::clamp<size_t>(contour_overlap_style, static_cast<size_t>(0UL), contour_overlap_styles.size());
-                    l_InvocationMetadata["reduction"] = (0.0 <= contouring_margin) ? "dilate" : "erode";
-                    l_InvocationMetadata["max_distance"] = std::to_string( std::abs( contouring_margin ) );
-
-                    Drover *d = (view_toggles.view_contouring_enabled) ? cdrover_ptr.get() : &DICOM_data;
-                    if(!Operation_Dispatcher(*d, l_InvocationMetadata, FilenameLex, Operations)){
-                        YLOGWARN("Dilation/Erosion failed");
-                    }
-
-                    if(view_toggles.view_contouring_enabled){
-                        contouring_img_altered = true;
-                    }else if(view_toggles.view_drawing_enabled){
-                        need_to_reload_opengl_texture.store(true);
-                    }
-                }
-
-                ImGui::Separator();
-                ImGui::Text("Clearing");
-                const bool button_clear_one_slice = ImGui::Button("Clear this slice");
-                ImGui::SameLine();
-                const bool button_clear_all_slices = ImGui::Button("Clear all slices");
-
-                if( button_clear_one_slice
-                ||  button_clear_all_slices ){
-
-                    // Make snapshot of the current state.
-                    if( view_toggles.view_contouring_enabled ){
-                        cdrover_ptr = create_cdrover_snapshot(contouring_drover_cache, cdrover_ptr);
-                    }
-                    Drover *d = (view_toggles.view_contouring_enabled) ? cdrover_ptr.get() : &DICOM_data;
-
-                    auto [img_valid, img_array_ptr_it, img_it] = recompute_image_iters();
-                    if( view_toggles.view_contouring_enabled ){
-                        std::tie(img_valid, img_array_ptr_it, img_it) = recompute_cimage_iters();
-                    }
-                    if( img_valid ){
-                        if(false){
-                        }else if(button_clear_one_slice){
-                            img_it->fill_pixels(0.0f);
-                        }else if(button_clear_all_slices){
-                            for(auto & img : (*img_array_ptr_it)->imagecoll.images){
-                                img.fill_pixels(0.0f);
-                            }
-                        }else{
-                            throw std::logic_error("Unaccounted for button clicked");
+                        ImGui::PushID(static_cast<int>(primitive_idx));
+                        ImGui::Text("Primitive %zu (%s)", primitive_idx, kind_to_string(primitive->kind()));
+                        if(ImGui::IsItemHovered()){
+                            next_editor_hovered_primitive = primitive_idx;
                         }
-                    }
-                    if(d != nullptr ){
-                        d->Ensure_Contour_Data_Allocated();
-                        d->contour_data->ccs.clear();
-                    }
+                        int tag_idx = to_tag_index(primitive->tag);
+                        ImGui::SetNextItemWidth(140.0f);
+                        const bool tag_changed = ImGui::Combo("Tag", &tag_idx, "normal\0support\0");
+                        ImGui::SameLine();
+                        const bool delete_primitive_clicked = ImGui::Button("Delete##primitive");
 
-                    if(view_toggles.view_contouring_enabled){
-                        contouring_img_altered = true;
-                        contouring_drover_cache.trim(10UL);
-                    }else if(view_toggles.view_drawing_enabled){
-                        need_to_reload_opengl_texture.store(true);
-                    }
-                    last_mouse_button_0_down = 1E30;
-                    last_mouse_button_1_down = 1E30;
-                    last_mouse_button_pos = {};
-                }
-
-                ImGui::Separator();
-                ImGui::Text("Interpolation");
-                const bool button_interpolation_axially = ImGui::Button("Interpolate Axially");
-                if( ImGui::IsItemHovered() ){
-                    ImGui::BeginTooltip();
-                    ImGui::Text("Interpolate *cleared* slices."
-                                "\n\n"
-                                "Only cleared images will be filled in, and the"
-                                "\n image being viewed must be within the range of cleared images."
-                                "\n\n"
-                                "The cleared images must be bounded by non-cleared images."
-                                "\n\n"
-                                "Note: use *only* if contours/shapes are convex and axially aligned"
-                                "\n (e.g. the ends of a cylinder). Misaligned contours/shapes will"
-                                "\n be improperly interpolated.");
-                    ImGui::EndTooltip();
-                }
-                if(button_interpolation_axially){
-                    // Make snapshot of the current state.
-                    if( view_toggles.view_contouring_enabled ){
-                        cdrover_ptr = create_cdrover_snapshot(contouring_drover_cache, cdrover_ptr);
-                    }
-                    Drover *d = (view_toggles.view_contouring_enabled) ? cdrover_ptr.get() : &DICOM_data;
-
-                    auto [img_valid, img_array_ptr_it, img_it] = recompute_image_iters();
-                    if( view_toggles.view_contouring_enabled ){
-                        std::tie(img_valid, img_array_ptr_it, img_it) = recompute_cimage_iters();
-                    }
-                    if( img_valid ){
-
-                        // Build a spatial index.
-                        {
-                            std::list<planar_image_adjacency<float,double>::img_refw_t> selected_imgs;
-                            for(auto &img : (*img_array_ptr_it)->imagecoll.images){
-                                selected_imgs.push_back( std::ref(img) );
-                            }
-                            if(selected_imgs.empty()){
-                                throw std::invalid_argument("Unable to build spatial index: no images available. Cannot continue");
-                            }
-                            if(!Images_Form_Rectilinear_Grid(selected_imgs)){
-                                throw std::invalid_argument("Unable to build spatial index: images do not form a rectilinear grid. Cannot continue");
-                            }
-                        }
-                        const auto row_unit = (*img_array_ptr_it)->imagecoll.images.front().row_unit.unit();
-                        const auto col_unit = (*img_array_ptr_it)->imagecoll.images.front().col_unit.unit();
-                        const auto img_unit = (*img_array_ptr_it)->imagecoll.images.front().ortho_unit();
-
-                        planar_image_adjacency<float,double> img_adj( {}, { { std::ref((*img_array_ptr_it)->imagecoll) } }, img_unit );
-                        if(img_adj.int_to_img.empty()){
-                            throw std::invalid_argument("Unable to build spatial index: mapping is empty. Cannot continue.");
-                        }
-                        //auto beg = std::begin((*img_array_ptr_it)->imagecoll.images);
-                        //auto end = std::end((*img_array_ptr_it)->imagecoll.images);
-                        auto img_refw = typename planar_image_adjacency<float,double>::img_refw_t( std::ref(*img_it) );
-                        const auto img_N = img_adj.image_to_index(img_refw);
-
-                        // Scan outwards to find bounding image slices that have been altered.
-                        std::optional<int64_t> upper_img_N_opt;
-                        std::optional<int64_t> lower_img_N_opt;
-                        std::set<int64_t> gap_imgs;
-
-                        const auto scan_imgs = [&](int64_t increment,
-                                                   std::set<int64_t> &l_empty_imgs){
-
-                            std::optional<int64_t> first_nonempty_img;
-                            for(int64_t i = 0; ; i += increment){
-                                const auto l_img_N = img_N + i;
-                                const bool l_img_valid = img_adj.index_present(l_img_N);
-                                if( !l_img_valid ) break;
-
-                                const auto& img = img_adj.index_to_image(l_img_N);
-                                const auto mm = img.get().minmax();
-                                if( (mm.first < 0.5) &&  (mm.second < 0.5) ){
-                                    l_empty_imgs.insert(l_img_N);
-                                }else{
-                                    first_nonempty_img = l_img_N;
-                                    break;
+                        if(tag_changed){
+                            edit_current_sketch([&](Sketch &editable_sketch){
+                                if(auto *editable_primitive = editable_sketch.primitive(primitive_idx); editable_primitive != nullptr){
+                                    editable_primitive->tag = to_tag_value(tag_idx);
                                 }
-                            }
-                            return first_nonempty_img;
-                        };
-                        upper_img_N_opt = scan_imgs( 1, gap_imgs);
-                        lower_img_N_opt = scan_imgs(-1, gap_imgs);
+                            });
+                            ImGui::PopID();
+                            break;
+                        }
+                        if(delete_primitive_clicked){
+                            edit_current_sketch([&](Sketch &editable_sketch){
+                                editable_sketch.delete_primitive(primitive_idx);
+                            });
+                            ImGui::PopID();
+                            break;
+                        }
 
-                        if(false){
-                        }else if( !upper_img_N_opt || !lower_img_N_opt ){
-                            YLOGWARN("Unable to interpolate: one or both bounding slices were not found");
-                        }else if( (upper_img_N_opt.value() == lower_img_N_opt.value())
-                              ||  gap_imgs.empty() ){
-                            YLOGWARN("Unable to interpolate: no empty slices were found");
-                        }else{
-                            const auto &upper_img = img_adj.index_to_image( upper_img_N_opt.value() ).get();
-                            const auto &lower_img = img_adj.index_to_image( lower_img_N_opt.value() ).get();
-                            for(const auto& gap_img_N : gap_imgs){
-                                auto& gap_img = img_adj.index_to_image( gap_img_N ).get();
-                                const auto rows = gap_img.rows;
-                                const auto cols = gap_img.columns;
-                                const auto chns = gap_img.channels;
-
-                                for(int64_t l_row = 0L; l_row < rows; ++l_row){
-                                    for(int64_t l_col = 0L; l_col < cols; ++l_col){
-                                        const auto upper_pos = upper_img.position(l_row, l_col);
-                                        const auto lower_pos = lower_img.position(l_row, l_col);
-                                        const auto gap_pos   = gap_img.position(l_row, l_col);
-                                        const auto d_gl  = gap_pos.distance(lower_pos);
-                                        const auto d_gu  = gap_pos.distance(upper_pos);
-                                        const auto d_tot = d_gl + d_gu;
-                                        for(int64_t l_chn = 0L; l_chn < chns; ++l_chn){
-                                            const auto upper_val = upper_img.value(l_row, l_col, l_chn);
-                                            const auto lower_val = lower_img.value(l_row, l_col, l_chn);
-
-                                            const auto x = lower_val + (upper_val - lower_val) * (d_gl / d_tot);
-                                            gap_img.reference(l_row, l_col, l_chn) = x;
-                                        }
+                        bool primitive_changed = false;
+                        if(const auto *vertex_primitive = dynamic_cast<const Sketch::vertex_primitive_t*>(primitive); vertex_primitive != nullptr){
+                            int vertex_ref = static_cast<int>(vertex_primitive->vertex);
+                            ImGui::SetNextItemWidth(120.0f);
+                            primitive_changed = ImGui::InputInt("Vertex Index", &vertex_ref);
+                            if(primitive_changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_primitive = dynamic_cast<Sketch::vertex_primitive_t*>(editable_sketch.primitive(primitive_idx)); editable_primitive != nullptr){
+                                        editable_primitive->vertex = clamp_debug_index(vertex_ref, vertex_count);
+                                        editable_sketch.refresh_geometry();
                                     }
-                                }
+                                });
+                                ImGui::PopID();
+                                break;
                             }
-                            YLOGINFO("Interpolated " << gap_imgs.size() << " images axially");
+                        }else if(const auto *line = dynamic_cast<const Sketch::line_primitive_t*>(primitive); line != nullptr){
+                            int v0 = static_cast<int>(line->vertices[0]);
+                            int v1 = static_cast<int>(line->vertices[1]);
+                            ImGui::SetNextItemWidth(120.0f);
+                            primitive_changed = ImGui::InputInt("Start Vertex", &v0);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(120.0f);
+                            primitive_changed = ImGui::InputInt("Stop Vertex", &v1) || primitive_changed;
+                            if(primitive_changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_primitive = dynamic_cast<Sketch::line_primitive_t*>(editable_sketch.primitive(primitive_idx)); editable_primitive != nullptr){
+                                        editable_primitive->vertices[0] = clamp_debug_index(v0, vertex_count);
+                                        editable_primitive->vertices[1] = clamp_debug_index(v1, vertex_count);
+                                        editable_sketch.refresh_geometry();
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *circle = dynamic_cast<const Sketch::circle_primitive_t*>(primitive); circle != nullptr){
+                            int center_idx = static_cast<int>(circle->center);
+                            int radius_idx = static_cast<int>(circle->radius_point);
+                            double radius = circle->radius;
+                            ImGui::SetNextItemWidth(110.0f);
+                            primitive_changed = ImGui::InputInt("Center Vertex", &center_idx);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(110.0f);
+                            primitive_changed = ImGui::InputInt("Radius Vertex", &radius_idx) || primitive_changed;
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(110.0f);
+                            primitive_changed = ImGui::InputDouble("Radius", &radius) || primitive_changed;
+                            if(primitive_changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_primitive = dynamic_cast<Sketch::circle_primitive_t*>(editable_sketch.primitive(primitive_idx)); editable_primitive != nullptr){
+                                        editable_primitive->center = clamp_debug_index(center_idx, vertex_count);
+                                        editable_primitive->radius_point = clamp_debug_index(radius_idx, vertex_count);
+                                        const auto centre = editable_sketch.vertex(editable_primitive->center);
+                                        auto dir = editable_sketch.vertex(editable_primitive->radius_point) - centre;
+                                        if(dir.sq_length() <= std::numeric_limits<double>::epsilon()){
+                                            dir = editable_sketch.plane().row_unit;
+                                        }
+                                        editable_sketch.vertex(editable_primitive->radius_point) = centre + dir.unit() * std::max(radius, 0.0);
+                                        editable_sketch.refresh_geometry();
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *arc = dynamic_cast<const Sketch::arc_primitive_t*>(primitive); arc != nullptr){
+                            int center_idx = static_cast<int>(arc->center);
+                            int start_idx = static_cast<int>(arc->start);
+                            int stop_idx = static_cast<int>(arc->stop);
+                            double radius = arc->radius;
+                            double start_angle = arc->start_angle;
+                            double stop_angle = arc->stop_angle;
+                            ImGui::SetNextItemWidth(95.0f);
+                            primitive_changed = ImGui::InputInt("Center", &center_idx);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(95.0f);
+                            primitive_changed = ImGui::InputInt("Start", &start_idx) || primitive_changed;
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(95.0f);
+                            primitive_changed = ImGui::InputInt("Stop", &stop_idx) || primitive_changed;
+                            ImGui::SetNextItemWidth(100.0f);
+                            primitive_changed = ImGui::InputDouble("Radius", &radius) || primitive_changed;
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(100.0f);
+                            primitive_changed = ImGui::InputDouble("Start Angle", &start_angle) || primitive_changed;
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(100.0f);
+                            primitive_changed = ImGui::InputDouble("Stop Angle", &stop_angle) || primitive_changed;
+                            if(primitive_changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_primitive = dynamic_cast<Sketch::arc_primitive_t*>(editable_sketch.primitive(primitive_idx)); editable_primitive != nullptr){
+                                        editable_primitive->center = clamp_debug_index(center_idx, vertex_count);
+                                        editable_primitive->start = clamp_debug_index(start_idx, vertex_count);
+                                        editable_primitive->stop = clamp_debug_index(stop_idx, vertex_count);
+                                        const auto centre = editable_sketch.vertex(editable_primitive->center);
+                                        const auto r = std::max(radius, 0.0);
+                                        const auto &plane = editable_sketch.plane();
+                                        editable_sketch.vertex(editable_primitive->start) = centre + plane.row_unit * (std::cos(start_angle) * r)
+                                                                                                  + plane.col_unit * (std::sin(start_angle) * r);
+                                        editable_sketch.vertex(editable_primitive->stop) = centre + plane.row_unit * (std::cos(stop_angle) * r)
+                                                                                                 + plane.col_unit * (std::sin(stop_angle) * r);
+                                        editable_sketch.refresh_geometry();
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *bezier = dynamic_cast<const Sketch::bezier_primitive_t*>(primitive); bezier != nullptr){
+                            int v0 = static_cast<int>(bezier->control_vertices[0]);
+                            int v1 = static_cast<int>(bezier->control_vertices[1]);
+                            int v2 = static_cast<int>(bezier->control_vertices[2]);
+                            int v3 = static_cast<int>(bezier->control_vertices[3]);
+                            ImGui::SetNextItemWidth(90.0f);
+                            primitive_changed = ImGui::InputInt("P0", &v0);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(90.0f);
+                            primitive_changed = ImGui::InputInt("P1", &v1) || primitive_changed;
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(90.0f);
+                            primitive_changed = ImGui::InputInt("P2", &v2) || primitive_changed;
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(90.0f);
+                            primitive_changed = ImGui::InputInt("P3", &v3) || primitive_changed;
+                            if(primitive_changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_primitive = dynamic_cast<Sketch::bezier_primitive_t*>(editable_sketch.primitive(primitive_idx)); editable_primitive != nullptr){
+                                        editable_primitive->control_vertices[0] = clamp_debug_index(v0, vertex_count);
+                                        editable_primitive->control_vertices[1] = clamp_debug_index(v1, vertex_count);
+                                        editable_primitive->control_vertices[2] = clamp_debug_index(v2, vertex_count);
+                                        editable_primitive->control_vertices[3] = clamp_debug_index(v3, vertex_count);
+                                        editable_sketch.refresh_geometry();
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
                         }
-                    }
-                    if(d != nullptr ){
-                        d->Ensure_Contour_Data_Allocated();
-                        d->contour_data->ccs.clear();
+                        ImGui::PopID();
                     }
 
-                    if(view_toggles.view_contouring_enabled){
-                        contouring_img_altered = true;
-                    }else if(view_toggles.view_drawing_enabled){
-                        need_to_reload_opengl_texture.store(true);
-                    }
-                    last_mouse_button_0_down = 1E30;
-                    last_mouse_button_1_down = 1E30;
-                    last_mouse_button_pos = {};
-                }
-
-                if(view_toggles.view_contouring_enabled){
                     ImGui::Separator();
-                    ImGui::Text("Contour Extraction");
-                    if(ImGui::DragInt("Resolution", &contouring_img_row_col_count, 0.1f, 5, 1024)){
-                        reset_contouring_state(img_array_ptr_it);
-                        contouring_img_altered = true;
-                    }
-                    if( ImGui::IsItemHovered() ){
-                        ImGui::BeginTooltip();
-                        ImGui::Text("Note: any existing contours will be reset.");
-                        ImGui::EndTooltip();
-                    }
-                    if(ImGui::Button("Marching squares")){
-                        contouring_method = "marching-squares";
-                        contouring_img_altered = true;
-                    }
-                    ImGui::SameLine();
-                    if(ImGui::Button("Binary")){
-                        contouring_method = "binary";
-                        contouring_img_altered = true;
-                    }
+                    ImGui::Text("Constraints");
+                    for(std::size_t constraint_idx = 0U; constraint_idx < slot.history.current().constraint_count(); ++constraint_idx){
+                        const auto *constraint = slot.history.current().constraint(constraint_idx);
+                        if(constraint == nullptr) continue;
 
-                    // Regenerate contours from the mask.
-                    cdrover_ptr->Ensure_Contour_Data_Allocated();
-                    if( auto [cimg_valid, cimg_array_ptr_it, cimg_it] = recompute_cimage_iters();
-                        cimg_valid
-                    &&  contouring_img_altered
-                    &&  (frame_count % 5 == 0) ){ // Terrible stop-gap until I can parallelize contour extraction. TODO
+                        const auto primitive_count = slot.history.current().primitive_count();
+                        const auto vertex_count = slot.history.current().vertex_count();
 
-                        // Only bother extracting contours for the current and adjacent images.
-                        const auto beg_it = std::begin((*cimg_array_ptr_it)->imagecoll.images);
-                        const auto end_it = std::end((*cimg_array_ptr_it)->imagecoll.images);
-                        Drover shtl;
-                        shtl.Ensure_Contour_Data_Allocated();
-                        shtl.image_data.push_back(std::make_unique<Image_Array>());
-                        //shtl.image_data.back()->imagecoll.images.emplace_back();
-
-                        if( contouring_show_adjacent
-                        &&  (cimg_it != beg_it) ){
-                            shtl.image_data.back()->imagecoll.images.emplace_back( *(std::prev(cimg_it)) );
+                        ImGui::PushID(static_cast<int>(constraint_idx));
+                        ImGui::Text("Constraint %zu (%s)", constraint_idx, slot.history.current().describe_constraint(constraint_idx).c_str());
+                        if(ImGui::IsItemHovered()){
+                            next_editor_hovered_constraint = constraint_idx;
                         }
-                        shtl.image_data.back()->imagecoll.images.emplace_back( *cimg_it );
-                        if( contouring_show_adjacent
-                        &&  (std::next(cimg_it) != end_it) ){
-                            shtl.image_data.back()->imagecoll.images.emplace_back( *(std::next(cimg_it)) );
-                        }
-
-                        std::list<OperationArgPkg> Operations;
-                        const bool op_load_res = Load_Standard_Script( Operations, "plumbing", "extract contours from mask" );
-                        if(!op_load_res) throw std::runtime_error("Unable to load script");
-                        metadata_map_t l_InvocationMetadata;
-                        l_InvocationMetadata["method"] = contouring_method;
-
-                        if(!Operation_Dispatcher(shtl, l_InvocationMetadata, FilenameLex, Operations)){
-                            YLOGWARN("ContourViaThreshold failed");
-                        }
-
-                        cdrover_ptr->contour_data->ccs.clear();
-                        cdrover_ptr->Consume( shtl.contour_data );
-
-                        contouring_img_altered = false;
-                    }
-
-                    // Draw the WIP contours.
-                    cdrover_ptr->Ensure_Contour_Data_Allocated();
-                    if( auto [cimg_valid, cimg_array_ptr_it, cimg_it] = recompute_cimage_iters();
-                        cimg_valid
-                    &&  (cdrover_ptr->Has_Contour_Data()) ){
-                        const auto cimg_dicom_width = cimg_it->pxl_dx * cimg_it->columns;
-                        const auto cimg_dicom_height = cimg_it->pxl_dy * cimg_it->rows; 
-                        //const auto cimg_top_left = cimg_it->anchor + cimg_it->offset
-                        //                         - cimg_it->row_unit * cimg_it->pxl_dx * 0.5f
-                        //                         - cimg_it->col_unit * cimg_it->pxl_dy * 0.5f;
-                        //const auto cimg_top_right = cimg_top_left + cimg_it->row_unit * cimg_dicom_width;
-                        //const auto cimg_bottom_left = cimg_top_left + cimg_it->col_unit * cimg_dicom_height;
-                        //const auto cimg_plane = cimg_it->image_plane();
-
-                        for(const auto &cc : cdrover_ptr->contour_data->ccs){
-                            for(const auto &cop : cc.contours){
-                                if( cop.points.empty() ) continue;
-                                //if( !cimg_it->sandwiches_point_within_top_bottom_planes( cop.points.front() ) ) continue;
-                                const bool is_in_plane = cimg_it->sandwiches_point_within_top_bottom_planes(cop.points.front());
-
-                                if( !contouring_show_adjacent
-                                &&  !is_in_plane) continue;
-
-                                imgs_window_draw_list->PathClear();
-                                for(auto & p : cop.points){
-
-                                    //Clamp the point to the bounding box, using the top left as zero.
-                                    const auto dR = p - img_top_left;
-                                    const auto clamped_col = dR.Dot( cimg_it->row_unit ) / cimg_dicom_width;
-                                    const auto clamped_row = dR.Dot( cimg_it->col_unit ) / cimg_dicom_height;
-
-                                    //Convert to ImGui coordinates using the top-left position of the display image.
-                                    const auto world_x = real_pos.x + real_extent.x * clamped_col;
-                                    const auto world_y = real_pos.y + real_extent.y * clamped_row;
-
-                                    ImVec2 v;
-                                    v.x = world_x + (is_in_plane ? 0.0 : 0.1);
-                                    v.y = world_y;
-                                    imgs_window_draw_list->PathLineTo( v );
+                        bool enabled = constraint->enabled;
+                        bool changed = ImGui::Checkbox("Enabled", &enabled);
+                        ImGui::SameLine();
+                        const bool delete_constraint_clicked = ImGui::Button("Delete##constraint");
+                        if(changed){
+                            edit_current_sketch([&](Sketch &editable_sketch){
+                                if(auto *editable_constraint = editable_sketch.constraint(constraint_idx); editable_constraint != nullptr){
+                                    editable_constraint->enabled = enabled;
                                 }
+                            });
+                            ImGui::PopID();
+                            break;
+                        }
+                        if(delete_constraint_clicked){
+                            edit_current_sketch([&](Sketch &editable_sketch){
+                                editable_sketch.delete_constraint(constraint_idx);
+                            });
+                            ImGui::PopID();
+                            break;
+                        }
 
-                                float thickness = contour_line_thickness;
-                                ImU32 colour = ImGui::GetColorU32(editing_contour_colour);
-
-                                if(is_in_plane){
-                                    if(contour_colour_from_orientation){
-                                        const auto arb_pos_unit = disp_img_it->row_unit.Cross(disp_img_it->col_unit).unit();
-                                        vec3<double> c_orient;
-                                        try{ // Protect against degenerate contours. (Should we instead ignore them altogether?)
-                                            c_orient = cop.Estimate_Planar_Normal();
-                                        }catch(const std::exception &){
-                                            c_orient = arb_pos_unit;
-                                        }
-                                        const auto c_orient_pos = (c_orient.Dot(arb_pos_unit) > 0);
-                                        colour = ( c_orient_pos ? ImGui::GetColorU32(pos_contour_colour)
-                                                                : ImGui::GetColorU32(neg_contour_colour) );
+                        if(const auto *horizontal = dynamic_cast<const Sketch::horizontal_constraint_t*>(constraint); horizontal != nullptr){
+                            int line_idx = static_cast<int>(horizontal->line);
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Line", &line_idx);
+                            if(changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_constraint = dynamic_cast<Sketch::horizontal_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
+                                        editable_constraint->line = clamp_debug_index(line_idx, primitive_count);
                                     }
-                                }else{
-                                    colour = ImGui::GetColorU32(adjacent_contour_colour);
-                                    //thickness = contour_line_thickness;
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *vertical = dynamic_cast<const Sketch::vertical_constraint_t*>(constraint); vertical != nullptr){
+                            int line_idx = static_cast<int>(vertical->line);
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Line", &line_idx);
+                            if(changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_constraint = dynamic_cast<Sketch::vertical_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
+                                        editable_constraint->line = clamp_debug_index(line_idx, primitive_count);
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *distance = dynamic_cast<const Sketch::distance_constraint_t*>(constraint); distance != nullptr){
+                            int primitive_idx = static_cast<int>(distance->primitive);
+                            double target_distance = distance->target_distance;
+                            const char *target_label = "Target Distance";
+                            if(const auto *distance_primitive = slot.history.current().primitive(distance->primitive); distance_primitive != nullptr){
+                                if(distance_primitive->kind() == Sketch::primitive_kind_t::line){
+                                    target_label = "Length";
+                                }else if((distance_primitive->kind() == Sketch::primitive_kind_t::circle)
+                                      || (distance_primitive->kind() == Sketch::primitive_kind_t::arc)){
+                                    target_label = "Radius";
                                 }
-
-                                const bool closed = true;
-                                imgs_window_draw_list->PathStroke( colour, closed, thickness);
-                                //AddPolyline(const ImVec2* points, int num_points, ImU32 col, bool closed, float thickness);
+                            }
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Primitive", &primitive_idx);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(120.0f);
+                            changed = ImGui::InputDouble(target_label, &target_distance) || changed;
+                            if(changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_constraint = dynamic_cast<Sketch::distance_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
+                                        editable_constraint->primitive = clamp_debug_index(primitive_idx, primitive_count);
+                                        editable_constraint->target_distance = target_distance;
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *parallel = dynamic_cast<const Sketch::parallel_constraint_t*>(constraint); parallel != nullptr){
+                            int line_a = static_cast<int>(parallel->line_a);
+                            int line_b = static_cast<int>(parallel->line_b);
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Line A", &line_a);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Line B", &line_b) || changed;
+                            if(changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_constraint = dynamic_cast<Sketch::parallel_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
+                                        editable_constraint->line_a = clamp_debug_index(line_a, primitive_count);
+                                        editable_constraint->line_b = clamp_debug_index(line_b, primitive_count);
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *perpendicular = dynamic_cast<const Sketch::perpendicular_constraint_t*>(constraint); perpendicular != nullptr){
+                            int line_a = static_cast<int>(perpendicular->line_a);
+                            int line_b = static_cast<int>(perpendicular->line_b);
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Line A", &line_a);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Line B", &line_b) || changed;
+                            if(changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_constraint = dynamic_cast<Sketch::perpendicular_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
+                                        editable_constraint->line_a = clamp_debug_index(line_a, primitive_count);
+                                        editable_constraint->line_b = clamp_debug_index(line_b, primitive_count);
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *pin = dynamic_cast<const Sketch::pin_constraint_t*>(constraint); pin != nullptr){
+                            int vertex_idx = static_cast<int>(pin->vertex);
+                            double x = pin->pinned_position.x;
+                            double y = pin->pinned_position.y;
+                            double z = pin->pinned_position.z;
+                            ImGui::SetNextItemWidth(100.0f);
+                            changed = ImGui::InputInt("Vertex", &vertex_idx);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(100.0f);
+                            changed = ImGui::InputDouble("Pin X", &x) || changed;
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(100.0f);
+                            changed = ImGui::InputDouble("Pin Y", &y) || changed;
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(100.0f);
+                            changed = ImGui::InputDouble("Pin Z", &z) || changed;
+                            if(changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_constraint = dynamic_cast<Sketch::pin_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
+                                        editable_constraint->vertex = clamp_debug_index(vertex_idx, vertex_count);
+                                        editable_constraint->pinned_position = vec3<double>(x, y, z);
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *tangent = dynamic_cast<const Sketch::tangent_constraint_t*>(constraint); tangent != nullptr){
+                            int primitive_a = static_cast<int>(tangent->primitive_a);
+                            int primitive_b = static_cast<int>(tangent->primitive_b);
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Primitive A", &primitive_a);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Primitive B", &primitive_b) || changed;
+                            if(changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_constraint = dynamic_cast<Sketch::tangent_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
+                                        editable_constraint->primitive_a = clamp_debug_index(primitive_a, primitive_count);
+                                        editable_constraint->primitive_b = clamp_debug_index(primitive_b, primitive_count);
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *mirror = dynamic_cast<const Sketch::mirror_constraint_t*>(constraint); mirror != nullptr){
+                            int line_idx = static_cast<int>(mirror->line);
+                            int vertex_a = static_cast<int>(mirror->vertex_a);
+                            int vertex_b = static_cast<int>(mirror->vertex_b);
+                            ImGui::SetNextItemWidth(100.0f);
+                            changed = ImGui::InputInt("Line", &line_idx);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(100.0f);
+                            changed = ImGui::InputInt("Vertex A", &vertex_a) || changed;
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(100.0f);
+                            changed = ImGui::InputInt("Vertex B", &vertex_b) || changed;
+                            if(changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_constraint = dynamic_cast<Sketch::mirror_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
+                                        editable_constraint->line = clamp_debug_index(line_idx, primitive_count);
+                                        editable_constraint->vertex_a = clamp_debug_index(vertex_a, vertex_count);
+                                        editable_constraint->vertex_b = clamp_debug_index(vertex_b, vertex_count);
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
+                            }
+                        }else if(const auto *overlap = dynamic_cast<const Sketch::overlap_constraint_t*>(constraint); overlap != nullptr){
+                            int vertex_a = static_cast<int>(overlap->vertex_a);
+                            int vertex_b = static_cast<int>(overlap->vertex_b);
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Vertex A", &vertex_a);
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(110.0f);
+                            changed = ImGui::InputInt("Vertex B", &vertex_b) || changed;
+                            if(changed){
+                                edit_current_sketch([&](Sketch &editable_sketch){
+                                    if(auto *editable_constraint = dynamic_cast<Sketch::overlap_constraint_t*>(editable_sketch.constraint(constraint_idx)); editable_constraint != nullptr){
+                                        editable_constraint->vertex_a = clamp_debug_index(vertex_a, vertex_count);
+                                        editable_constraint->vertex_b = clamp_debug_index(vertex_b, vertex_count);
+                                    }
+                                });
+                                ImGui::PopID();
+                                break;
                             }
                         }
+                        ImGui::PopID();
                     }
                 }
+                sketch_editor_hovered_primitive = next_editor_hovered_primitive;
+                sketch_editor_hovered_vertex = next_editor_hovered_vertex;
+                sketch_editor_hovered_constraint = next_editor_hovered_constraint;
+                ImGui::EndChild();
                 ImGui::End();
+            }else{
+                sketch_editor_hovered_primitive = {};
+                sketch_editor_hovered_vertex = {};
+                sketch_editor_hovered_constraint = {};
             }
-
-            // Draw a tooltip with position and voxel intensity information.
-            if( image_mouse_pos.mouse_hovering_image
-            &&  view_toggles.show_image_hover_tooltips
-            &&  !view_toggles.view_contouring_enabled ){
-                ImGui::BeginTooltip();
-                if(tagged_pos){
-                    ImGui::Text("Distance: %.4f", tagged_pos.value().distance(image_mouse_pos.dicom_pos));
-                }
-                ImGui::Text("Image coordinates: %.4f, %.4f", image_mouse_pos.region_y, image_mouse_pos.region_x);
-                ImGui::Text("Pixel coordinates: (r, c) = %" PRId64 ", %" PRId64, image_mouse_pos.r, image_mouse_pos.c);
-                ImGui::Text("Mouse coordinates: (x, y, z) = %.4f, %.4f, %.4f", image_mouse_pos.dicom_pos.x, image_mouse_pos.dicom_pos.y, image_mouse_pos.dicom_pos.z);
-                ImGui::Text("Voxel coordinates: (x, y, z) = %.4f, %.4f, %.4f", image_mouse_pos.voxel_pos.x, image_mouse_pos.voxel_pos.y, image_mouse_pos.voxel_pos.z);
-                if(disp_img_it->channels == 1){
-                    ImGui::Text("Voxel intensity:   %.4f", disp_img_it->value(image_mouse_pos.r, image_mouse_pos.c, 0L));
-                    try{
-                        const auto frc = disp_img_it->fractional_row_column(image_mouse_pos.dicom_pos);
-                        const auto bilin_interp = disp_img_it->bilinearly_interpolate_in_pixel_number_space(frc.first, frc.second, 0L);
-                        ImGui::Text("Mouse intensity:   %.4f (lin. interp. at %.4f, %.4f)", bilin_interp, frc.first, frc.second);
-                    }catch(const std::exception &){}
-                }else{
-                    std::stringstream ss;
-                    for(int64_t chan = 0; chan < disp_img_it->channels; ++chan){
-                        ss << disp_img_it->value(image_mouse_pos.r, image_mouse_pos.c, chan) << " ";
-                    }
-                    ImGui::Text("Voxel intensities: %s", ss.str().c_str());
-                }
-                ImGui::EndTooltip();
-            }
-            ImGui::End();
-
-            // Extract data for row and column profiles.
-            if( image_mouse_pos.mouse_hovering_image
-            &&  view_toggles.view_row_column_profiles ){
-                row_profile.samples.clear();
-                col_profile.samples.clear();
-
-                auto common_metadata = coalesce_metadata_for_lsamp(disp_img_it->metadata);
-
-                for(auto i = 0; i < disp_img_it->columns; ++i){
-                    const auto val_raw = disp_img_it->value(image_mouse_pos.r,i,img_channel);
-                    const auto col_num = static_cast<double>(i);
-                    if(std::isfinite(val_raw)) row_profile.push_back({ col_num, 0.0, val_raw, 0.0 });
-                }
-
-                for(auto i = 0; i < disp_img_it->rows; ++i){
-                    const auto val_raw = disp_img_it->value(i,image_mouse_pos.c,img_channel);
-                    const auto row_num = static_cast<double>(i);
-                    if(std::isfinite(val_raw)) col_profile.push_back({ row_num, 0.0, val_raw, 0.0 });
-                }
-
-                row_profile.metadata = common_metadata;
-                row_profile.metadata["Abscissa"] = "ColumnNumber";
-                row_profile.metadata["CurrentAbscissa"] = std::to_string(image_mouse_pos.c);
-
-                col_profile.metadata = common_metadata;
-                col_profile.metadata["Abscissa"] = "RowNumber";
-                col_profile.metadata["CurrentAbscissa"] = std::to_string(image_mouse_pos.r);
-            }
-
-            // Extract data for time profiles.
-            if( image_mouse_pos.mouse_hovering_image
-            &&  view_toggles.view_time_profiles ){
-                time_profile.samples.clear();
-                time_profile.metadata.clear();
-
-                std::string abscissa_key; //As it appears in the metadata. Must convert to a double!
-                array_to_string(abscissa_key, time_course_abscissa_key);
-                const auto meta_key = disp_img_it->GetMetadataValueAs<double>(abscissa_key);
-
-                double n_img = 0.0;
-                const bool sort_on_append = false;
-
-                const auto ortho = disp_img_it->row_unit.Cross( disp_img_it->col_unit ).unit();
-                const std::list<vec3<double>> points = { image_mouse_pos.dicom_pos,
-                                                         image_mouse_pos.dicom_pos + ortho * disp_img_it->pxl_dz * 0.25,
-                                                         image_mouse_pos.dicom_pos - ortho * disp_img_it->pxl_dz * 0.25 };
-
-                decltype((*img_array_ptr_it)->imagecoll.get_all_images()) selected_imgs;
-                if(time_course_image_inclusivity == time_course_image_inclusivity_t::current){
-                    auto encompassing_images = (*img_array_ptr_it)->imagecoll.get_images_which_encompass_all_points(points);
-                    selected_imgs.splice( std::end(selected_imgs), encompassing_images);
-
-                }else if(time_course_image_inclusivity == time_course_image_inclusivity_t::all){
-                    for(const auto &img_arr_ptr : DICOM_data.image_data){
-                        auto encompassing_images = img_arr_ptr->imagecoll.get_images_which_encompass_all_points(points);
-                        selected_imgs.splice( std::end(selected_imgs), encompassing_images);
-                    }
-
-                }else{
-                    throw std::invalid_argument("Unrecognized abscissa inclusisivity");
-                }
-                auto common_metadata = planar_image_collection<float,double>().get_common_metadata(selected_imgs);
-                common_metadata = coalesce_metadata_for_lsamp(common_metadata);
-
-                //Cycle over the images, dumping the ordinate (pixel values) vs abscissa (time) derived from metadata.
-                int64_t n_current_img = 0;
-                for(const auto &enc_img_it : selected_imgs){
-                    const auto l_meta_key = enc_img_it->GetMetadataValueAs<double>(abscissa_key);
-                    if(l_meta_key.has_value() != meta_key.has_value()) continue;
-                    const auto abscissa = l_meta_key.value_or(n_img);
-
-                    if(std::addressof(*disp_img_it) == std::addressof(*enc_img_it)) n_current_img = n_img;
-                    try{
-                        const auto val_raw = enc_img_it->value(image_mouse_pos.dicom_pos, 0);
-                        if(std::isfinite(val_raw)){
-                            time_profile.push_back( abscissa, 0.0, 
-                                                    static_cast<double>(val_raw), 0.0,
-                                                    sort_on_append );
-                        }
-                    }catch(const std::exception &){ }
-                    n_img += 1.0;
-                }
-                time_profile.stable_sort();
-                time_profile.metadata = common_metadata;
-                time_profile.metadata["Abscissa"] = (meta_key) ? abscissa_key : "ImageNumber";
-                time_profile.metadata["CurrentAbscissa"] = (meta_key) ? std::to_string(meta_key.value()) : std::to_string(n_current_img);
-
-                if( time_course_abscissa_relative
-                &&  !time_profile.samples.empty() ){
-                    const auto first_a = time_profile.Get_Extreme_Datum_x().first[0];
-                    time_profile = time_profile.Sum_x_With(-first_a);
-                    apply_as<double>(time_profile.metadata, "CurrentAbscissa",
-                                     [first_a](double x){ return x - first_a; });
-                }
-            }
-
-            // Image metadata window.
-            if( view_toggles.view_image_metadata_enabled ){
-                ImGui::SetNextWindowSize(ImVec2(650, 650), ImGuiCond_FirstUseEver);
-                ImGui::Begin("Image Metadata", &view_toggles.view_image_metadata_enabled);
-
-                display_metadata_table( disp_img_it->metadata );
-
-                ImGui::End();
-            }
-            image_mouse_pos_opt = image_mouse_pos;
-            return;
         };
         try{
-            display_image_viewer();
+            display_sketch_viewer();
         }catch(const std::exception &e){
-            YLOGWARN("Exception in display_image_viewer(): '" << e.what() << "'");
+            YLOGWARN("Exception in display_sketch_viewer(): '" << e.what() << "'");
             throw;
         }
 
@@ -12226,6 +12810,196 @@ bool SDL_Viewer(Drover &DICOM_data,
             const auto mv = camera * model;
             const auto mvp = proj * mv;
             const auto norm = extract_normal_matrix(mv);
+
+            if(sketch_mesh_face_adoption.active){
+                sketch_mesh_face_adoption.hovered_plane = {};
+                sketch_mesh_face_adoption.hovered_face_vertices.clear();
+                sketch_mesh_face_adoption.hovered_coplanar_faces.clear();
+                sketch_mesh_face_adoption.hovered_rectangle_visible = false;
+
+                auto [mesh_is_valid, smesh_ptr_it] = recompute_smesh_iters();
+                if(mesh_is_valid && !io.WantCaptureMouse){
+                    const auto transform_point = [&](const vec3<double> &point) -> std::array<double, 4> {
+                        const std::array<double, 4> in = { point.x, point.y, point.z, 1.0 };
+                        std::array<double, 4> out = { 0.0, 0.0, 0.0, 0.0 };
+                        for(int r = 0; r < 4; ++r){
+                            for(int c = 0; c < 4; ++c){
+                                out[r] += static_cast<double>(mvp.read_coeff(r, c)) * in.at(c);
+                            }
+                        }
+                        return out;
+                    };
+                    const auto to_screen = [&](const vec3<double> &point) -> std::optional<ImVec2> {
+                        const auto clip = transform_point(point);
+                        if(std::abs(clip.at(3)) <= std::numeric_limits<double>::epsilon()){
+                            return {};
+                        }
+                        const auto ndc_x = clip.at(0) / clip.at(3);
+                        const auto ndc_y = clip.at(1) / clip.at(3);
+                        if(!std::isfinite(ndc_x) || !std::isfinite(ndc_y)){
+                            return {};
+                        }
+                        return ImVec2(static_cast<float>((0.5 * (ndc_x + 1.0)) * io.DisplaySize.x),
+                                      static_cast<float>((0.5 * (1.0 - ndc_y)) * io.DisplaySize.y));
+                    };
+                    const auto point_in_triangle_2d = [](const ImVec2 &p,
+                                                          const ImVec2 &a,
+                                                          const ImVec2 &b,
+                                                          const ImVec2 &c) -> bool {
+                        const auto sign = [](const ImVec2 &p1, const ImVec2 &p2, const ImVec2 &p3) -> float {
+                            return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+                        };
+                        const auto d1 = sign(p, a, b);
+                        const auto d2 = sign(p, b, c);
+                        const auto d3 = sign(p, c, a);
+                        const bool has_neg = (d1 < 0.0f) || (d2 < 0.0f) || (d3 < 0.0f);
+                        const bool has_pos = (0.0f < d1) || (0.0f < d2) || (0.0f < d3);
+                        return !(has_neg && has_pos);
+                    };
+
+                    std::optional<std::size_t> hovered_face_index;
+                    double hovered_depth = std::numeric_limits<double>::infinity();
+                    const auto &mesh = (*smesh_ptr_it)->meshes;
+                    for(std::size_t face_idx = 0U; face_idx < mesh.faces.size(); ++face_idx){
+                        const auto &face = mesh.faces.at(face_idx);
+                        if(face.size() < 3U) continue;
+                        const auto &face_a = mesh.vertices.at(face.at(0));
+                        for(std::size_t tri_idx = 2U; tri_idx < face.size(); ++tri_idx){
+                            const auto &face_b = mesh.vertices.at(face.at(tri_idx - 1U));
+                            const auto &face_c = mesh.vertices.at(face.at(tri_idx));
+                            const auto screen_a = to_screen(face_a);
+                            const auto screen_b = to_screen(face_b);
+                            const auto screen_c = to_screen(face_c);
+                            if(!screen_a || !screen_b || !screen_c) continue;
+                            if(!point_in_triangle_2d(io.MousePos, screen_a.value(), screen_b.value(), screen_c.value())){
+                                continue;
+                            }
+                            const auto clip_a = transform_point(face_a);
+                            const auto clip_b = transform_point(face_b);
+                            const auto clip_c = transform_point(face_c);
+                            const auto depth = (clip_a.at(2) / clip_a.at(3)
+                                              + clip_b.at(2) / clip_b.at(3)
+                                              + clip_c.at(2) / clip_c.at(3)) / 3.0;
+                            if(depth < hovered_depth){
+                                hovered_depth = depth;
+                                hovered_face_index = face_idx;
+                            }
+                        }
+                    }
+
+                    if(hovered_face_index){
+                        const auto &face = mesh.faces.at(hovered_face_index.value());
+                        if(3U <= face.size()){
+                            const auto &a = mesh.vertices.at(face.at(0));
+                            const auto &b = mesh.vertices.at(face.at(1));
+                            const auto &c = mesh.vertices.at(face.at(2));
+                            const auto normal = (b - a).Cross(c - a).unit();
+                            const auto centroid = (a + b + c) / 3.0;
+                            // Use the first face edge as the in-plane hint so the adopted sketch frame stays tangent to
+                            // the hovered triangle while remaining stable across repeated hovers and clicks.
+                            sketch_mesh_face_adoption.hovered_plane = Sketch::plane_frame_t::from_plane(plane<double>(normal, centroid), b - a);
+                            sketch_mesh_face_adoption.hovered_face_vertices.assign({ a, b, c });
+
+                            auto face_min = Sketch::projection_t{  std::numeric_limits<double>::infinity(),  std::numeric_limits<double>::infinity() };
+                            auto face_max = Sketch::projection_t{ -std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity() };
+                            for(const auto &vertex : sketch_mesh_face_adoption.hovered_face_vertices){
+                                const auto p = Sketch::projection_t{
+                                    sketch_mesh_face_adoption.hovered_plane->row_unit.Dot(vertex - sketch_mesh_face_adoption.hovered_plane->origin),
+                                    sketch_mesh_face_adoption.hovered_plane->col_unit.Dot(vertex - sketch_mesh_face_adoption.hovered_plane->origin)
+                                };
+                                face_min.u = std::min(face_min.u, p.u);
+                                face_min.v = std::min(face_min.v, p.v);
+                                face_max.u = std::max(face_max.u, p.u);
+                                face_max.v = std::max(face_max.v, p.v);
+                            }
+                            constexpr double kHoveredFaceMinPadding = 1.0;
+                            constexpr double kHoveredFacePaddingScale = 0.15;
+                            const auto pad_u = std::max(kHoveredFaceMinPadding, (face_max.u - face_min.u) * kHoveredFacePaddingScale);
+                            const auto pad_v = std::max(kHoveredFaceMinPadding, (face_max.v - face_min.v) * kHoveredFacePaddingScale);
+                            face_min.u -= pad_u;
+                            face_min.v -= pad_v;
+                            face_max.u += pad_u;
+                            face_max.v += pad_v;
+                            const auto rectangle_world = std::array<vec3<double>, 4>{
+                                sketch_mesh_face_adoption.hovered_plane->origin
+                                    + sketch_mesh_face_adoption.hovered_plane->row_unit * face_min.u
+                                    + sketch_mesh_face_adoption.hovered_plane->col_unit * face_min.v,
+                                sketch_mesh_face_adoption.hovered_plane->origin
+                                    + sketch_mesh_face_adoption.hovered_plane->row_unit * face_max.u
+                                    + sketch_mesh_face_adoption.hovered_plane->col_unit * face_min.v,
+                                sketch_mesh_face_adoption.hovered_plane->origin
+                                    + sketch_mesh_face_adoption.hovered_plane->row_unit * face_max.u
+                                    + sketch_mesh_face_adoption.hovered_plane->col_unit * face_max.v,
+                                sketch_mesh_face_adoption.hovered_plane->origin
+                                    + sketch_mesh_face_adoption.hovered_plane->row_unit * face_min.u
+                                    + sketch_mesh_face_adoption.hovered_plane->col_unit * face_max.v,
+                            };
+                            bool rectangle_visible = true;
+                            for(std::size_t i = 0U; i < rectangle_world.size(); ++i){
+                                const auto screen_point = to_screen(rectangle_world.at(i));
+                                if(!screen_point){
+                                    rectangle_visible = false;
+                                    break;
+                                }
+                                sketch_mesh_face_adoption.hovered_rectangle.at(i) = screen_point.value();
+                            }
+                            sketch_mesh_face_adoption.hovered_rectangle_visible = rectangle_visible;
+                            if(rectangle_visible){
+                                auto *overlay_draw_list = ImGui::GetForegroundDrawList();
+                                for(std::size_t i = 0U; i < rectangle_world.size(); ++i){
+                                    overlay_draw_list->AddLine(sketch_mesh_face_adoption.hovered_rectangle.at(i),
+                                                               sketch_mesh_face_adoption.hovered_rectangle.at((i + 1U) % rectangle_world.size()),
+                                                               ImColor(1.0f, 0.8f, 0.2f, 1.0f),
+                                                               2.0f);
+                                }
+                            }
+
+                            if(sketch_mesh_face_adoption.include_coplanar_geometry){
+                                const auto hovered_plane = sketch_mesh_face_adoption.hovered_plane->to_plane();
+                                for(const auto &candidate_face : mesh.faces){
+                                    if(candidate_face.size() < 3U) continue;
+                                    std::vector<vec3<double>> candidate_loop;
+                                    candidate_loop.reserve(candidate_face.size());
+                                    bool candidate_valid = true;
+                                    for(const auto vertex_idx : candidate_face){
+                                        const auto &vertex = mesh.vertices.at(vertex_idx);
+                                        const auto projected = Sketch::projection_t{
+                                            sketch_mesh_face_adoption.hovered_plane->row_unit.Dot(vertex - sketch_mesh_face_adoption.hovered_plane->origin),
+                                            sketch_mesh_face_adoption.hovered_plane->col_unit.Dot(vertex - sketch_mesh_face_adoption.hovered_plane->origin)
+                                        };
+                                        const bool is_coplanar = (std::abs(hovered_plane.Get_Signed_Distance_To_Point(vertex))
+                                                               <= sketch_mesh_face_adoption.coplanar_eps);
+                                        const bool in_bounds = (face_min.u <= projected.u) && (projected.u <= face_max.u)
+                                                            && (face_min.v <= projected.v) && (projected.v <= face_max.v);
+                                        if(!is_coplanar || !in_bounds){
+                                            candidate_valid = false;
+                                            break;
+                                        }
+                                        candidate_loop.emplace_back(vertex);
+                                    }
+                                    if(candidate_valid){
+                                        sketch_mesh_face_adoption.hovered_coplanar_faces.emplace_back(std::move(candidate_loop));
+                                    }
+                                }
+                            }
+
+                            if(ImGui::IsMouseClicked(ImGuiMouseButton_Left)){
+                                sketch_plane_adoption_payload_t payload;
+                                payload.plane = sketch_mesh_face_adoption.hovered_plane.value();
+                                if(sketch_mesh_face_adoption.include_face_geometry){
+                                    payload.support_loops.emplace_back(sketch_mesh_face_adoption.hovered_face_vertices);
+                                }
+                                if(sketch_mesh_face_adoption.include_coplanar_geometry){
+                                    payload.support_loops.insert(payload.support_loops.end(),
+                                                                 sketch_mesh_face_adoption.hovered_coplanar_faces.begin(),
+                                                                 sketch_mesh_face_adoption.hovered_coplanar_faces.end());
+                                }
+                                pending_sketch_plane_adoption = std::move(payload);
+                            }
+                        }
+                    }
+                }
+            }
 
             // Pass uniforms to custom shader program iff they are needed.
             const std::vector<float> mv_data( mv.cbegin(), mv.cend() );
