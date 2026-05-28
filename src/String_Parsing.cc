@@ -40,7 +40,7 @@ template std::optional<double     > get_as(const std::string &);
 template std::optional<std::string> get_as(const std::string &);
 
 
-void array_to_string(std::string &s, const std::array<char, 2048> &a){
+void array_to_string(std::string &s, const std::array<char, 4096> &a){
     s.clear();
     for(const auto &c : a){
         if(c == '\0') break;
@@ -49,13 +49,13 @@ void array_to_string(std::string &s, const std::array<char, 2048> &a){
     return;
 }
 
-std::string array_to_string(const std::array<char, 2048> &a){
+std::string array_to_string(const std::array<char, 4096> &a){
     std::string s;
     array_to_string(s,a);
     return s;
 }
 
-void string_to_array(std::array<char, 2048> &a, const std::string &s){
+void string_to_array(std::array<char, 4096> &a, const std::string &s){
     a.fill('\0');
     for(size_t i = 0; (i < s.size()) && ((i+1) < a.size()); ++i){
         a[i] = s[i];
@@ -64,8 +64,8 @@ void string_to_array(std::array<char, 2048> &a, const std::string &s){
     return;
 }
 
-std::array<char, 2048> string_to_array(const std::string &s){
-    std::array<char, 2048> a;
+std::array<char, 4096> string_to_array(const std::string &s){
+    std::array<char, 4096> a;
     string_to_array(a,s);
     return a;
 }

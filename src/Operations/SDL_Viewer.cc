@@ -319,9 +319,9 @@ class ogl_shader_program {
 
 static
 std::unique_ptr<ogl_shader_program>
-compile_shader_program(const std::array<char, 2048> &vert_shader_src,
-                       const std::array<char, 2048> &frag_shader_src,
-                       std::array<char, 2048> &shader_log ){
+compile_shader_program(const std::array<char, 4096> &vert_shader_src,
+                       const std::array<char, 4096> &frag_shader_src,
+                       std::array<char, 4096> &shader_log ){
     shader_log.fill('\0');
     std::stringstream ss;
     try{
@@ -988,7 +988,7 @@ bool SDL_Viewer(Drover &DICOM_data,
     std::vector<cell_edit_action_t> cell_redo_stack;
     bool cell_edit_undo_pushed = false;
 
-    std::array<char, 2048> formula_bar_buf;
+    std::array<char, 4096> formula_bar_buf;
     string_to_array(formula_bar_buf, "");
     bool formula_bar_was_active = false;
 
@@ -1035,7 +1035,7 @@ bool SDL_Viewer(Drover &DICOM_data,
 
         std::string metadata_key = "FrameOfReferenceUID";
         std::string description;
-        std::array<char, 2048> buff;
+        std::array<char, 4096> buff;
 
         float snap_dist = 5.0f; // Distance between mouse click and feature to 'snap' click to existing feature.
 
@@ -1089,13 +1089,13 @@ bool SDL_Viewer(Drover &DICOM_data,
         all,      // Spatially overlapping pixels from within any image array.
     } time_course_image_inclusivity = time_course_image_inclusivity_t::current;
     bool time_course_abscissa_relative = false;
-    std::array<char, 2048> time_course_abscissa_key;
+    std::array<char, 4096> time_course_abscissa_key;
     string_to_array(time_course_abscissa_key, "ContentTime");
-    std::array<char, 2048> time_course_text_entry;
+    std::array<char, 4096> time_course_text_entry;
     string_to_array(time_course_text_entry, "");
-    std::array<char, 2048> row_profile_text_entry;
+    std::array<char, 4096> row_profile_text_entry;
     string_to_array(row_profile_text_entry, "");
-    std::array<char, 2048> col_profile_text_entry;
+    std::array<char, 4096> col_profile_text_entry;
     string_to_array(col_profile_text_entry, "");
 
     // --------------------------------------------- Setup ------------------------------------------------
@@ -1224,20 +1224,19 @@ bool SDL_Viewer(Drover &DICOM_data,
     const auto shader_presets = get_glsl_shader_presets();
     int selected_shader_preset = 0;
 
-    std::array<char, 2048> vert_shader_src = string_to_array(
+    std::array<char, 4096> vert_shader_src = string_to_array(
         "#version " + glsl_version + "\n" + shader_presets.at(0).vertex_shader );
 
-    std::array<char, 2048> frag_shader_src = string_to_array(
+    std::array<char, 4096> frag_shader_src = string_to_array(
         "#version " + glsl_version + "\n" + shader_presets.at(0).fragment_shader );
 
-    std::array<char, 2048> shader_log; // Output from most recent compilation and linking.
+    std::array<char, 4096> shader_log; // Output from most recent compilation and linking.
 
     //YLOGINFO("Using default vertex shader source: '" << array_to_string(vert_shader_src) << "'");
     //YLOGINFO("Using default fragment shader source: '" << array_to_string(frag_shader_src) << "'");
 
     // Note: the following will throw if the default shader fails to compile and link.
     auto custom_shader = compile_shader_program(vert_shader_src, frag_shader_src, shader_log);
-
     // -------------------------------- Functors for various things ---------------------------------------
 
     // Create an OpenGL texture from an image.
@@ -1264,7 +1263,7 @@ bool SDL_Viewer(Drover &DICOM_data,
 
     // Lexicon customizer state.
     std::map<std::string, std::string> lexicon_overrides;
-    std::array<char, 2048> lexicon_override_buffer;
+    std::array<char, 4096> lexicon_override_buffer;
     string_to_array(lexicon_override_buffer, "");
     auto lexicon_exact_match_colour = ImVec4(0.0f, 1.0f, 1.0f, 1.0f);
 
@@ -1299,7 +1298,7 @@ bool SDL_Viewer(Drover &DICOM_data,
     cdrover_ptr->image_data.push_back(std::make_unique<Image_Array>());
     cdrover_ptr->image_data.back()->imagecoll.images.emplace_back();
 
-    std::array<char, 2048> new_contour_name;
+    std::array<char, 4096> new_contour_name;
     string_to_array(new_contour_name, "");
     bool overwrite_existing_contours = false;
     std::optional<decltype(std::begin(DICOM_data.contour_data->ccs))> edit_existing_contour_selection;
@@ -2915,7 +2914,7 @@ bool SDL_Viewer(Drover &DICOM_data,
                 ImGui::TableSetupColumn("Value");
                 ImGui::TableHeadersRow();
 
-                std::array<char, 2048> metadata_text_entry;
+                std::array<char, 4096> metadata_text_entry;
                 string_to_array(metadata_text_entry, "");
 
                 int i = 0;
@@ -2980,7 +2979,7 @@ bool SDL_Viewer(Drover &DICOM_data,
 
     // Open file dialog state.
     std::filesystem::path open_file_root = std::filesystem::current_path();
-    std::array<char,2048> root_entry_text;
+    std::array<char, 4096> root_entry_text;
 
     recompute_image_state();
     recompute_scale_bar_image_state();
@@ -8675,8 +8674,8 @@ bool SDL_Viewer(Drover &DICOM_data,
                 {
                     auto &active = builder.active_node();
                     int proc_idx = static_cast<int>(active.procedure.kind);
-                    const char *proc_items[] = { "clear", "noop", "extrusion", "through_hole" };
-                    if(ImGui::Combo("Procedure", &proc_idx, proc_items, 4)){
+                    const char *proc_items[] = { "clear", "noop", "extrusion", "through_hole", "extend", "carve" };
+                    if(ImGui::Combo("Procedure", &proc_idx, proc_items, 6)){
                         active.procedure.kind = static_cast<sketch_procedure_kind_t>(proc_idx);
                     }
                 }
@@ -10322,7 +10321,7 @@ bool SDL_Viewer(Drover &DICOM_data,
                     ImGui::TableSetupScrollFreeze(0, 1); // Lock the column numbers onto the top when scrolling.
                     ImGui::TableHeadersRow();
 
-                    std::array<char, 2048> buf;
+                    std::array<char, 4096> buf;
                     string_to_array(buf, "");
 
                     // Resize column widths.
@@ -12670,16 +12669,7 @@ bool SDL_Viewer(Drover &DICOM_data,
                 draw_list->AddRect(rect_min, rect_max, ImGui::GetColorU32(ImGuiCol_Border));
 
                 if(sketch_mesh_face_adoption.active && viewport_hovered && input_state.mouse_clicked.at(0)){
-                    const auto preview_matrices = Mesh_Widget::compute_matrices(sketch_builder_mesh_display_transform,
-                                                                               viewport);
-                    const auto hover_state = Mesh_Widget::compute_hover_state(*preview_mesh,
-                                                                             preview_matrices,
-                                                                             viewport,
-                                                                             input_state.mouse_x,
-                                                                             input_state.mouse_y,
-                                                                             std::max(0.0, input_state.coplanar_eps),
-                                                                             input_state.collect_coplanar_faces);
-                    if(const auto payload = make_sketch_plane_adoption_payload(hover_state)){
+                    if(const auto payload = make_sketch_plane_adoption_payload(sketch_builder_mesh_widget.hovered_face())){
                         pending_sketch_plane_adoption = payload;
                     }
                 }

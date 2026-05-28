@@ -17,13 +17,13 @@ get_as(const std::string &in);
 
 
 // String <--> fixed array conversion routines.
-void array_to_string(std::string &s, const std::array<char, 2048> &a);
+void array_to_string(std::string &s, const std::array<char, 4096> &a);
 
-std::string array_to_string(const std::array<char, 2048> &a);
+std::string array_to_string(const std::array<char, 4096> &a);
 
-void string_to_array(std::array<char, 2048> &a, const std::string &s);
+void string_to_array(std::array<char, 4096> &a, const std::string &s);
 
-std::array<char, 2048> string_to_array(const std::string &s);
+std::array<char, 4096> string_to_array(const std::string &s);
 
 // Remove characters so that the argument can be inserted like '...' on command line.
 std::string escape_for_quotes(std::string s);

@@ -28,6 +28,20 @@ static Sketch make_circle_sketch(double cx, double cy, double r){
     return sketch;
 }
 
+static Sketch make_rectangle_sketch(double cx, double cy, double hx, double hy){
+    Sketch sketch;
+    sketch.set_plane(default_xy_plane());
+    const auto a = vec3<double>(cx - hx, cy - hy, 0.0);
+    const auto b = vec3<double>(cx + hx, cy - hy, 0.0);
+    const auto c = vec3<double>(cx + hx, cy + hy, 0.0);
+    const auto d = vec3<double>(cx - hx, cy + hy, 0.0);
+    sketch.add_line(a, b, Sketch::geometry_tag_t::normal);
+    sketch.add_line(b, c, Sketch::geometry_tag_t::normal);
+    sketch.add_line(c, d, Sketch::geometry_tag_t::normal);
+    sketch.add_line(d, a, Sketch::geometry_tag_t::normal);
+    return sketch;
+}
+
 static Sketch make_sparse_circle_sketch(){
     std::stringstream ss;
     ss << "sketch_format_version 1\n"
@@ -79,7 +93,9 @@ TEST_CASE("Sketch_Procedure kind string conversion"){
     for(auto kind : { sketch_procedure_kind_t::clear,
                       sketch_procedure_kind_t::noop,
                       sketch_procedure_kind_t::extrusion,
-                      sketch_procedure_kind_t::through_hole }){
+                      sketch_procedure_kind_t::through_hole,
+                      sketch_procedure_kind_t::extend,
+                      sketch_procedure_kind_t::carve }){
         const auto s = sketch_procedure_kind_to_string(kind);
         sketch_procedure_kind_t out = sketch_procedure_kind_t::clear;
         REQUIRE(string_to_sketch_procedure_kind(s, out));
@@ -179,6 +195,42 @@ TEST_CASE("Sketch_Mesh_Builder last_mesh helpers track most recent computed mesh
     CHECK(builder.last_mesh_node_index().value() == 1U);
     REQUIRE(builder.last_mesh() != nullptr);
     CHECK(builder.last_mesh()->vertices.size() == builder.node(1).mesh->vertices.size());
+}
+
+TEST_CASE("Sketch_Mesh_Builder extend handles boolean failures without throwing"){
+    Sketch_Mesh_Builder builder;
+    builder.node(0).sketch = make_rectangle_sketch(0.0, 0.0, 8.0, 5.0);
+    builder.node(0).procedure.kind = sketch_procedure_kind_t::extrusion;
+    builder.node(0).procedure.extrusion_options.into_frame_length = 2.0;
+    builder.node(0).procedure.extrusion_options.out_of_frame_length = 2.0;
+
+    builder.append_default_node();
+    builder.node(1).sketch = make_rectangle_sketch(9.0, 0.0, 3.0, 2.5);
+    builder.node(1).procedure.kind = sketch_procedure_kind_t::extend;
+    builder.node(1).procedure.extrusion_options.into_frame_length = 2.0;
+    builder.node(1).procedure.extrusion_options.out_of_frame_length = 2.0;
+
+    std::string error_message;
+    REQUIRE(builder.compute_all(&error_message));
+    REQUIRE(builder.node(0).mesh.has_value());
+    REQUIRE(builder.node(1).mesh.has_value());
+    CHECK(builder.node(1).mesh->vertices.empty());
+    CHECK(builder.node(1).mesh->faces.empty());
+    CHECK(error_message.find("Boolean extend failed") != std::string::npos);
+}
+
+TEST_CASE("Sketch_Mesh_Builder carve without a parent yields an empty mesh"){
+    Sketch_Mesh_Builder builder;
+    builder.node(0).sketch = make_circle_sketch(0.0, 0.0, 5.0);
+    builder.node(0).procedure.kind = sketch_procedure_kind_t::carve;
+    builder.node(0).procedure.extrusion_options.into_frame_length = 1.5;
+    builder.node(0).procedure.extrusion_options.out_of_frame_length = 1.5;
+
+    std::string error_message;
+    REQUIRE(builder.compute_node(0U, &error_message));
+    REQUIRE(builder.node(0).mesh.has_value());
+    CHECK(builder.node(0).mesh->vertices.empty());
+    CHECK(builder.node(0).mesh->faces.empty());
 }
 
 // ---------------------------------------------------------------------------
