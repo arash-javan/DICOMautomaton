@@ -10,9 +10,10 @@
 #include <sstream>
 #include <stdexcept>
 
-#include "YgorLog.h"
-#include "YgorMathIOOBJ.h"
-#include <YgorMeshesBoolean.h>
+#include <YgorLog.h>
+#include <YgorMathIOOBJ.h>
+//#include <YgorMeshesBoolean.h>
+#include <YgorMeshesBoolean2.h>
 
 namespace {
 
@@ -48,13 +49,15 @@ build_extruded_mesh(const Sketch &sketch,
 fv_surface_mesh<double, uint64_t>
 boolean_union_meshes(const fv_surface_mesh<double, uint64_t> &parent_mesh,
                      const fv_surface_mesh<double, uint64_t> &child_mesh){
-    return BooleanUnion(parent_mesh, child_mesh, /*max_depth=*/5, /*boundary_scale=*/0.0);
+//    return BooleanUnion(parent_mesh, child_mesh, /*max_depth=*/5, /*boundary_scale=*/0.0);
+    return BooleanUnion2(parent_mesh, child_mesh, /*snap_eps=*/0.0);
 }
 
 fv_surface_mesh<double, uint64_t>
 boolean_subtract_meshes(const fv_surface_mesh<double, uint64_t> &parent_mesh,
                         const fv_surface_mesh<double, uint64_t> &child_mesh){
-    return BooleanSubtraction(parent_mesh, child_mesh, /*max_depth=*/5, /*boundary_scale=*/0.0);
+//    return BooleanSubtraction(parent_mesh, child_mesh, /*max_depth=*/5, /*boundary_scale=*/0.0);
+    return BooleanSubtraction2(parent_mesh, child_mesh, /*snap_eps=*/0.0);
 }
 
 template <class BooleanOp>
@@ -97,6 +100,20 @@ compute_boolean_procedure(const char *procedure_name,
             *error_message = std::string("Boolean ") + procedure_name + " failed with an unknown exception";
         }
     }
+
+    // Write the meshes to file for debugging purposes.
+    try{
+        {
+            std::fstream f("/tmp/dcma_mesh_A_extruded.obj", std::ifstream::out);
+            WriteFVSMeshToOBJ(extruded_mesh, f);
+            f.close();
+        }
+        {
+            std::fstream f("/tmp/dcma_mesh_B_parent.obj", std::ifstream::out);
+            WriteFVSMeshToOBJ(parent_mesh.value(), f);
+            f.close();
+        }
+    }catch(...){}
 
     result_mesh = make_empty_mesh();
     return true;
