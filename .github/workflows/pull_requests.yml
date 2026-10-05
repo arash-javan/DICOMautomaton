@@ -54,6 +54,7 @@ jobs:
         # which skips the zip/upload steps. Let the Windows .exe be uploaded anyway.
         continue-on-error: true
         run: |
+             cp /etc/apt/sources.list /tmp/sources.list.orig
              export DEBIAN_FRONTEND='noninteractive'
              sed -i -e 's@stable@bullseye@g' /etc/apt/sources.list
              apt-get update --yes
@@ -74,6 +75,8 @@ jobs:
              ./unit_tests/compile_and_run.sh || true
       - name: create_zip
         run: |
+             # The test step points apt at bullseye; restore the original sources so apt-get works here.
+             cp /tmp/sources.list.orig /etc/apt/sources.list || true
              export short_sha="$(git rev-parse --short HEAD || printf 'unknown')"
              export DEBIAN_FRONTEND="noninteractive"
              apt-get update --yes
