@@ -54,7 +54,6 @@ jobs:
         # which skips the zip/upload steps. Let the Windows .exe be uploaded anyway.
         continue-on-error: true
         run: |
-             cp /etc/apt/sources.list /tmp/sources.list.orig
              export DEBIAN_FRONTEND='noninteractive'
              sed -i -e 's@stable@bullseye@g' /etc/apt/sources.list
              apt-get update --yes
@@ -73,25 +72,12 @@ jobs:
              dicomautomaton_dispatcher -h
              ./integration_tests/Run.sh -v
              ./unit_tests/compile_and_run.sh || true
-      - name: create_zip
-        run: |
-             # The test step points apt at bullseye; restore the original sources so apt-get works here.
-             cp /tmp/sources.list.orig /etc/apt/sources.list || true
-             export short_sha="$(git rev-parse --short HEAD || printf 'unknown')"
-             export DEBIAN_FRONTEND="noninteractive"
-             apt-get update --yes
-             apt-get install --yes --no-install-recommends coreutils binutils findutils rsync openssh-client patchelf zip
-             rm -rf ci_artifacts
-             mkdir -pv ci_artifacts
-             ( cd ./Windows/ && zip -r ../ci_artifacts/DICOMautomaton-latest-x86_64.zip . )
-             cp ci_artifacts/DICOMautomaton-latest-x86_64.zip "ci_artifacts/DICOMautomaton-${short_sha}-x86_64.zip"
-             find ci_artifacts/ -iname '*.zip' -print -execdir bash -c 'sha256sum "$@" > "$@".sha256sum' bash '{}' \;
       - name: deploy_to_github
+        # Personal build branch only: the build image is Debian bullseye, whose package
+        # repositories no longer respond, so any apt-get here fails (exit 100). Upload the
+        # built Windows/ folder directly instead of zipping it ourselves; GitHub zips it.
         uses: actions/upload-artifact@v4
         with:
           name: "DICOMautomaton-mxe-x86_64-exes"
           if-no-files-found: error
-          path: |
-                ci_artifacts/DICOMautomaton-latest-x86_64.zip
-                ci_artifacts/DICOMautomaton-latest-x86_64.zip.sha256sum
-
+          path: Windows/
